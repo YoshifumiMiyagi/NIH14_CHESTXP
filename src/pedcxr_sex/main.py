@@ -21,6 +21,7 @@ import timm
 
 import cv2
 from PIL import Image
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 # =========================
