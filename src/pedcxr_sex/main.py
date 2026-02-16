@@ -752,11 +752,42 @@ def make_thorax_crop_memmap(images, masks, out_path, out_size=512):
     mm.flush()
     return mm
 
+def aggregate_seed_results(df_all: pd.DataFrame, age_bins=((0,4),(5,9),(10,14),(15,18))):
+    """
+    df_all: rows = (seed x model)
+    returns: df_agg with mean/sd per model
+    """
+    # 集計対象カラム
+    cols = ["val_auc_best", "test_auc_all"]
+    for lo, hi in age_bins:
+        cols.append(f"test_auc_{lo}-{hi}")
+
+    # 数値化（念のため）
+    for c in cols:
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+
+    g = df_all.groupby("model", dropna=False)
+
+    mean_df = g[cols].mean(numeric_only=True).reset_index()
+    sd_df   = g[cols].std(ddof=1, numeric_only=True).reset_index()
+
+    mean_df["stat"] = "mean"
+    sd_df["stat"]   = "sd"
+
+    df_agg = pd.concat([mean_df, sd_df], axis=0, ignore_index=True)
+
+    # 見やすい順
+    front = ["model", "stat"]
+    rest = [c for c in df_agg.columns if c not in front]
+    df_agg = df_agg[front + rest]
+    return df_agg
+
 
 # =========================
 # 8) main()
 # =========================
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--img_npy", type=str, required=True,
                         help="cxr_pediatric_images512_...npy (dict with keys images/ages/patient_id/sex)")
@@ -775,10 +806,15 @@ def main():
                         help="apply thorax crop using precomputed lung mask")
     parser.add_argument("--lung_mask_npy", type=str, default="",
                         help="lung_mask_3400.npy (uint8 0/1), required if --do_crop")
+    parser.add_argument("--seeds", type=str, default="",
+                    help="comma separated seeds for repeated runs, e.g. 42,43,44,45,46. If set, overrides --seed")
+    parser.add_argument("--deterministic", action="store_true",
+                    help="enable deterministic cudnn/algorithms (better reproducibility, slower)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    set_seed(args.seed, deterministic=False)
+    set_seed(args.seed, deterministic=args.deterministic)
+
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -811,21 +847,74 @@ def main():
         print("Cropped images:", imgs.shape, float(np.min(imgs)), float(np.max(imgs)))
 
     model_names = [m.strip() for m in args.models.split(",") if m.strip()]
-    df = run_experiment(
-        exp_name=("Preproc+Crop" if (args.do_preprocess and args.do_crop)
-                  else "Preprocessing" if args.do_preprocess
-                  else "Thoracic_Crop" if args.do_crop
-                  else "Baseline"),
-        images=imgs, ages=ages, sex=sex, pids=pids,
-        model_names=model_names,
-        seed=args.seed, batch_size=args.batch, num_workers=args.workers,
-        epochs=args.epochs, base_lr=1e-4, use_amp=args.use_amp,
-        save_root=str(out_dir),
-        age_bins=((0,4),(5,9),(10,14),(15,18))
-    )
+
+    # --- seeds parsing ---
+    if args.seeds.strip():
+        seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
+    else:
+        seeds = [int(args.seed)]
+
+    exp_name = ("Preproc+Crop" if (args.do_preprocess and args.do_crop)
+                else "Preprocessing" if args.do_preprocess
+                else "Thoracic_Crop" if args.do_crop
+                else "Baseline")
+
+    all_rows = []
+    for s in seeds:
+        print("\n" + "#"*100)
+        print(f"SEED RUN: {s}")
+        print("#"*100)
+
+        set_seed(s, deterministic=args.deterministic)
+
+        df = run_experiment(
+            exp_name=f"{exp_name}_seed{s}",
+            images=imgs, ages=ages, sex=sex, pids=pids,
+            model_names=model_names,
+            seed=s, batch_size=args.batch, num_workers=args.workers,
+            epochs=args.epochs, base_lr=1e-4, use_amp=args.use_amp,
+            save_root=str(out_dir),
+            age_bins=((0,4),(5,9),(10,14),(15,18))
+        )
+        df["seed"] = s
+        all_rows.append(df)
+
+    df_all = pd.concat(all_rows, axis=0, ignore_index=True)
+
+    # --- save per-seed results ---
+    out_csv_all = out_dir / f"results_{exp_name}_seedRepeated.csv"
+    df_all.to_csv(out_csv_all, index=False)
+    print("saved:", out_csv_all)
+
+    # --- aggregate mean/sd across seeds per model ---
+    df_agg = aggregate_seed_results(df_all, age_bins=((0,4),(5,9),(10,14),(15,18)))
+    out_csv_agg = out_dir / f"results_{exp_name}_seedRepeated_mean_sd.csv"
+    df_agg.to_csv(out_csv_agg, index=False)
+    print("saved:", out_csv_agg)
+
+    # --- print summary: test AUC mean±SD per model ---
+    # 取り出しやすいように pivot
+    piv = df_agg.pivot(index="model", columns="stat", values="test_auc_all")
+    print("\n=== SUMMARY (test_auc_all) ===")
+    for m in piv.index:
+        mu = piv.loc[m].get("mean", np.nan)
+        sd = piv.loc[m].get("sd", np.nan)
+        print(f"{m}: {mu:.3f} ± {sd:.3f}")
+
+    # bin別も出す（存在する列だけ）
+    for lo, hi in ((0,4),(5,9),(10,14),(15,18)):
+        col = f"test_auc_{lo}-{hi}"
+        if col in df_all.columns:
+            pivb = df_agg.pivot(index="model", columns="stat", values=col)
+            print(f"\n=== SUMMARY ({col}) ===")
+            for m in pivb.index:
+                mu = pivb.loc[m].get("mean", np.nan)
+                sd = pivb.loc[m].get("sd", np.nan)
+                print(f"{m}: {mu:.3f} ± {sd:.3f}")
 
     print("\n=== DONE ===")
-    print(df)
+    print(df_agg)
+
 
 
 if __name__ == "__main__":
