@@ -1,19 +1,14 @@
 # NIH14_CHESTXP
 
-'''
-!pwd
-'''
+## Clone Repository
 
-'''
-!git clone https://github.com/YoshifumiMiyagi/NIH14_CHESTXP.git
-'''
+```bash
+git clone https://github.com/YoshifumiMiyagi/NIH14_CHESTXP.git
+cd NIH14_CHESTXP
+```
 
+## Check CLI Options
 
-'''
-%cd NIH14_CHESTXP
-!pwd
-'''
-
-'''
-!python -m src.pedcxr_sex.main --help
-'''
+```bash
+python -m src.pedcxr_sex.main --help
+```
