@@ -1,11 +1,19 @@
 # NIH14_CHESTXP
 
-'''!pwd'''
+'''
+!pwd
+'''
 
-'''!git clone https://github.com/YoshifumiMiyagi/NIH14_CHESTXP.git'''
+'''
+!git clone https://github.com/YoshifumiMiyagi/NIH14_CHESTXP.git
+'''
 
 
-'''%cd NIH14_CHESTXP'''
-'''!pwd
+'''
+%cd NIH14_CHESTXP
+!pwd
+'''
 
-'''!python -m src.pedcxr_sex.main --help'''
+'''
+!python -m src.pedcxr_sex.main --help
+'''
