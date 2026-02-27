@@ -668,6 +668,50 @@ def run_train_seg(model, train_loader, val_loader, device,
 
     return str(save_path), best
 
+# =========================
+# (ADD) Seg inference utils
+# =========================
+class SegInferDataset(Dataset):
+    def __init__(self, X, size=512):
+        self.X = X
+        self.size = size
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        img = np.asarray(self.X[i])
+        img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        img = img.astype(np.float32)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-6)
+        img = torch.from_numpy(img).float().unsqueeze(0)  # (1,H,W)
+        return img, i
+
+@torch.no_grad()
+def infer_lung_masks_all(seg_model, images, device, batch_size=8, num_workers=2, thr=0.5, use_amp=True):
+    seg_model.eval()
+    ds = SegInferDataset(images, size=512)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp_enabled = bool(use_amp and device_type == "cuda")
+
+    N = len(images)
+    out = np.zeros((N, 512, 512), dtype=np.uint8)
+
+    for xb, idx in loader:
+        xb = xb.to(device, non_blocking=True)
+        with torch.amp.autocast(device_type, enabled=amp_enabled):
+            logits = seg_model(xb)          # (B,1,H,W) 想定
+        if logits.ndim == 3:
+            logits = logits.unsqueeze(1)
+        prob = torch.sigmoid(logits)[:, 0]  # (B,H,W)
+        pred = (prob > thr).to(torch.uint8).cpu().numpy()
+
+        idx = idx.cpu().numpy()
+        out[idx] = pred
+
+    return out
 
 # =========================
 # 7) Thorax crop by lung mask
@@ -807,6 +851,18 @@ def main(argv=None):
                         help="apply thorax crop using precomputed lung mask")
     parser.add_argument("--lung_mask_npy", type=str, default="",
                         help="lung_mask_3400.npy (uint8 0/1), required if --do_crop")
+    parser.add_argument("--train_seg", action="store_true",
+                        help="train lung segmentation using StackSegDataset and save weights")
+    parser.add_argument("--seg_xy_npy", type=str, default="",
+                        help="seg training data npy (dict with keys: images, masks). e.g. infant masks set")
+    parser.add_argument("--seg_epochs", type=int, default=30)
+    parser.add_argument("--seg_lr", type=float, default=2e-4)
+    parser.add_argument("--seg_unfreeze_epoch", type=int, default=10)
+    parser.add_argument("--seg_unfreeze_lr", type=float, default=1e-4)
+    parser.add_argument("--seg_batch", type=int, default=8)
+    parser.add_argument("--seg_thr", type=float, default=0.5)
+    parser.add_argument("--seg_weights", type=str, default="",
+                        help="path to pretrained seg weights. If empty and --train_seg, will use saved weights")
     parser.add_argument("--seeds", type=str, default="",
                     help="comma separated seeds for repeated runs, e.g. 42,43,44,45,46. If set, overrides --seed")
     parser.add_argument("--deterministic", action="store_true",
@@ -826,6 +882,89 @@ def main(argv=None):
     pids = data["patient_id"]
     sex  = data["sex"]
 
+    # =========================
+    # (ADD) Train seg / make masks if needed
+    # =========================
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    seg_weights_path = args.seg_weights.strip()
+    if args.train_seg:
+        if not args.seg_xy_npy:
+            raise ValueError("--train_seg requires --seg_xy_npy (dict: images, masks)")
+        seg_data = np.load(args.seg_xy_npy, allow_pickle=True).item()
+        Xs = np.asarray(seg_data["images"]).astype(np.float32)
+        Ys = np.asarray(seg_data["masks"]).astype(np.uint8)
+        if Ys.ndim == 4:
+            Ys = Ys[..., 0]
+
+        # simple 80/20 split（小規模mask想定なのでまずはこれで）
+        N = len(Xs)
+        rng = np.random.RandomState(args.seed)
+        idx = np.arange(N)
+        rng.shuffle(idx)
+        n_tr = int(N * 0.8)
+        tr_idx, va_idx = idx[:n_tr], idx[n_tr:]
+
+        tr_ds = StackSegDataset(Xs, Ys, indices=tr_idx, size=512, do_aug=True)
+        va_ds = StackSegDataset(Xs, Ys, indices=va_idx, size=512, do_aug=False)
+
+        g_seg = torch.Generator()
+        g_seg.manual_seed(args.seed)
+
+        tr_loader = DataLoader(tr_ds, batch_size=args.seg_batch, shuffle=True,
+                               num_workers=args.workers, pin_memory=True,
+                               worker_init_fn=lambda wid: worker_init_fn(wid, args.seed),
+                               generator=g_seg)
+        va_loader = DataLoader(va_ds, batch_size=args.seg_batch, shuffle=False,
+                               num_workers=args.workers, pin_memory=True,
+                               worker_init_fn=lambda wid: worker_init_fn(wid, args.seed),
+                               generator=g_seg)
+
+        seg_model = ResNet18UNet(pretrained=True).to(device)
+
+        seg_out = Path(args.out_dir) / "seg"
+        seg_out.mkdir(parents=True, exist_ok=True)
+        save_path = seg_out / "lungseg_best.pt"
+
+        wpath, best_dice = run_train_seg(
+            seg_model,
+            tr_loader, va_loader,
+            device=device,
+            epochs=args.seg_epochs,
+            lr=args.seg_lr,
+            unfreeze_epoch=args.seg_unfreeze_epoch,
+            unfreeze_lr=args.seg_unfreeze_lr,
+            patience=8,
+            save_path=str(save_path),
+            use_amp=args.use_amp
+        )
+        print("Seg training done. weights:", wpath, "best_dice:", best_dice)
+        seg_weights_path = str(save_path)
+
+    # --- If cropping is requested but mask file is not provided, try to infer masks using seg weights
+    if args.do_crop and (not args.lung_mask_npy):
+        if not seg_weights_path:
+            raise ValueError("--do_crop requires --lung_mask_npy OR seg weights via --seg_weights / --train_seg")
+        print(">>> --do_crop: no lung_mask_npy provided. Will infer masks using:", seg_weights_path)
+
+        ckpt = torch.load(seg_weights_path, map_location=device)
+        seg_model = ResNet18UNet(pretrained=False).to(device)
+        # run_train_seg saves {"model": state_dict, ...}
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        seg_model.load_state_dict(state, strict=True)
+
+        masks_pred = infer_lung_masks_all(
+            seg_model, imgs, device=device,
+            batch_size=args.seg_batch, num_workers=args.workers,
+            thr=args.seg_thr, use_amp=args.use_amp
+        )
+        out_mask = Path(args.out_dir) / "lung_mask_pred_512.npy"
+        np.save(out_mask, masks_pred.astype(np.uint8))
+        print("saved inferred masks:", out_mask, "shape:", masks_pred.shape)
+
+        # set as lung_mask_npy for the existing crop path
+        args.lung_mask_npy = str(out_mask)
+    
     imgs = np.asarray(imgs).astype(np.float32)
     print("Loaded images:", imgs.shape, imgs.min(), imgs.max())
 
