@@ -582,21 +582,28 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
     train_idx, val_idx, test_idx = split_train_val_test(
         idx_all, strata=strata, groups=pids, seed=seed
     )
-
     # ============================================================
     # Leakage check: pseudo pool vs train/val/test patient overlap
     # ============================================================
-    
     train_pid_set = set(np.asarray(pids)[train_idx].tolist())
     val_pid_set   = set(np.asarray(pids)[val_idx].tolist())
     test_pid_set  = set(np.asarray(pids)[test_idx].tolist())
     
-    pseudo_pid_set = set(np.asarray(pseudo_pids_safe).tolist())
+    pseudo_pid_set = set()
+    if pseudo_cfg is not None and pseudo_cfg.get("pids") is not None:
+        pseudo_pid_set = set(np.asarray(pseudo_cfg["pids"]).tolist())
     
     print("\n[Leakage Check]")
     print("pseudo ∩ train =", len(pseudo_pid_set & train_pid_set))
     print("pseudo ∩ val   =", len(pseudo_pid_set & val_pid_set))
     print("pseudo ∩ test  =", len(pseudo_pid_set & test_pid_set))
+    
+    if len(pseudo_pid_set & train_pid_set) > 0:
+        print("WARNING: pseudo pool overlaps with TRAIN patients")
+    if len(pseudo_pid_set & val_pid_set) > 0:
+        print("WARNING: pseudo pool overlaps with VAL patients")
+    if len(pseudo_pid_set & test_pid_set) > 0:
+        print("WARNING: pseudo pool overlaps with TEST patients")
                        
     print("N (train/val/test):", len(train_idx), len(val_idx), len(test_idx))
     print("unique patients:", len(np.unique(np.asarray(pids)[train_idx])),
