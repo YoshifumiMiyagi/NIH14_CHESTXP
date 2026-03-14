@@ -115,9 +115,9 @@ def preprocess_images(imgs):
 def sex_to_int(s):
     ss = str(s).strip().lower()
     if ss in ["m", "male", "man", "1", "true"]:
-        return 1
-    if ss in ["f", "female", "woman", "0", "false"]:
         return 0
+    if ss in ["f", "female", "woman", "0", "false"]:
+        return 1
     # unknown -> raise (silent fail is dangerous)
     raise ValueError(f"Unknown sex label: {s}")
 
@@ -495,7 +495,7 @@ def run_one_model(name, train_loader, val_loader, test_loader, device,
                 pseudo_ds = EVACXRDataset(
                     images=np.asarray(pseudo_images)[keep_idx],
                     ages=np.asarray(pseudo_cfg.get("ages", np.full(len(pseudo_images), -1, dtype=np.float32)))[keep_idx],
-                    sex=np.where(pseudo_y == 1, "M", "F"),
+                    sex=np.where(pseudo_y == 0, "M", "F"),
                     sample_weight=pseudo_weight,
                 )
 
