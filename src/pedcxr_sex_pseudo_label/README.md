@@ -1,4 +1,4 @@
-# main_pseudo_retrain.py
+# main_pseudo.py
 
 `main_pseudo.py` は、小児胸部X線画像を用いた性別二値分類のための学習スクリプトです。
 主解析は **Baseline** と **Baseline + Pseudo Retrain** の比較で、pseudo-label を後段で微調整するのではなく、`train + pseudo` を用いて**最初から再学習**する設計をサポートします。
