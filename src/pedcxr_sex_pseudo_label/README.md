@@ -1,4 +1,5 @@
-<img width="755" height="1129" alt="image" src="https://github.com/user-attachments/assets/87689084-5a01-4379-83ec-3540b3749886" />
+<img width="750" height="1125" alt="image" src="https://github.com/user-attachments/assets/456ce8f1-99b2-4ce1-a906-eda95a5fb9f6" />
+
 
 # main_pseudo.py
 
