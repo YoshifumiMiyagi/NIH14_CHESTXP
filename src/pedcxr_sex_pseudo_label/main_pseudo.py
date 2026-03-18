@@ -494,49 +494,104 @@ def run_one_model(name, train_loader, val_loader, test_loader, device,
 
                 pseudo_ds = EVACXRDataset(
                     images=np.asarray(pseudo_images)[keep_idx],
-                    ages=np.asarray(pseudo_cfg.get("ages", np.full(len(pseudo_images), -1, dtype=np.float32)))[keep_idx],
+                    ages=np.asarray(
+                        pseudo_cfg.get("ages", np.full(len(pseudo_images), -1, dtype=np.float32))
+                    )[keep_idx],
                     sex=np.where(pseudo_y == 0, "M", "F"),
                     sample_weight=pseudo_weight,
                 )
 
                 mix_train_ds = ConcatDataset([train_ds, pseudo_ds])
+
+                # =========================
+                # PSEUDO MODE
+                #   - fine-tuning  : baseline modelを追加学習
+                #   - retrain      : 新しいモデルを train+pseudo で最初から学習
+                # =========================
+                pseudo_retrain = bool(pseudo_cfg.get("retrain", False))
+
                 g = torch.Generator()
-                g.manual_seed(seed + 1000)
+                retrain_seed = seed + (2000 if pseudo_retrain else 1000)
+                g.manual_seed(retrain_seed)
 
                 mix_train_loader = DataLoader(
-                    mix_train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                    pin_memory=True, worker_init_fn=lambda wid: worker_init_fn(wid, seed + 1000),
+                    mix_train_ds,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    worker_init_fn=lambda wid: worker_init_fn(wid, retrain_seed),
                     generator=g
                 )
 
-                ft_lr = float(pseudo_cfg.get("lr", lr * 0.5))
-                ft_epochs = int(pseudo_cfg.get("epochs", 1))
-                optimizer_ft = torch.optim.AdamW(model.parameters(), lr=ft_lr, weight_decay=weight_decay)
+                if pseudo_retrain:
+                    print(f"[{name}] pseudo-retrain phase started")
 
-                best_val_auc_ft = best_val_auc
-                best_ft_path = save_root / f"{name.replace('/','_')}_best_pseudo.pth"
+                    model_pseudo = build_model_any(name, num_classes=2).to(device)
+                    pseudo_lr = base_lr * 0.5 if "eva02" in name.lower() else base_lr
+                    pseudo_epochs = int(pseudo_cfg.get("retrain_epochs", epochs))
 
-                for epoch in range(1, ft_epochs + 1):
-                    loss_ft, t_train_ft = train_one_epoch(
-                        model, mix_train_loader, optimizer_ft, criterion, device, use_amp=use_amp
+                    optimizer_pseudo = torch.optim.AdamW(
+                        model_pseudo.parameters(), lr=pseudo_lr, weight_decay=weight_decay
                     )
-                    val_probs, val_y, val_age, t_valpred = predict_probs_labels_ages(
-                        model, val_loader, device, use_amp=use_amp
-                    )
-                    val_auc = safe_auc(val_y, val_probs)
 
-                    print(f"[{name}] pseudo epoch {epoch:02d}/{ft_epochs} "
-                          f"loss={loss_ft:.4f} val_auc={val_auc:.3f} "
-                          f"train_time={t_train_ft:.1f}s val_pred_time={t_valpred:.1f}s lr={ft_lr:g}")
+                    best_val_auc_pseudo = -1.0
+                    best_pseudo_path = save_root / f"{name.replace('/','_')}_best_pseudo_retrain.pth"
 
-                    if np.isfinite(val_auc) and val_auc > best_val_auc_ft:
-                        best_val_auc_ft = val_auc
-                        torch.save(model.state_dict(), best_ft_path)
-                        print("  -> saved best pseudo")
+                    for epoch in range(1, pseudo_epochs + 1):
+                        loss_pseudo, t_train_pseudo = train_one_epoch(
+                            model_pseudo, mix_train_loader, optimizer_pseudo, criterion, device, use_amp=use_amp
+                        )
+                        val_probs, val_y, val_age, t_valpred = predict_probs_labels_ages(
+                            model_pseudo, val_loader, device, use_amp=use_amp
+                        )
+                        val_auc = safe_auc(val_y, val_probs)
 
-                if best_ft_path.exists():
-                    model.load_state_dict(torch.load(best_ft_path, map_location=device))
-                    best_val_auc = best_val_auc_ft
+                        print(f"[{name}] pseudo-retrain epoch {epoch:02d}/{pseudo_epochs} "
+                              f"loss={loss_pseudo:.4f} val_auc={val_auc:.3f} "
+                              f"train_time={t_train_pseudo:.1f}s val_pred_time={t_valpred:.1f}s lr={pseudo_lr:g}")
+
+                        if np.isfinite(val_auc) and val_auc > best_val_auc_pseudo:
+                            best_val_auc_pseudo = val_auc
+                            torch.save(model_pseudo.state_dict(), best_pseudo_path)
+                            print("  -> saved best pseudo-retrain")
+
+                    if best_pseudo_path.exists():
+                        model_pseudo.load_state_dict(torch.load(best_pseudo_path, map_location=device))
+                        model = model_pseudo
+                        best_val_auc = best_val_auc_pseudo
+
+                else:
+                    print(f"[{name}] pseudo-fine-tuning phase started")
+
+                    ft_lr = float(pseudo_cfg.get("lr", lr * 0.5))
+                    ft_epochs = int(pseudo_cfg.get("epochs", 1))
+                    optimizer_ft = torch.optim.AdamW(model.parameters(), lr=ft_lr, weight_decay=weight_decay)
+
+                    best_val_auc_ft = best_val_auc
+                    best_ft_path = save_root / f"{name.replace('/','_')}_best_pseudo.pth"
+
+                    for epoch in range(1, ft_epochs + 1):
+                        loss_ft, t_train_ft = train_one_epoch(
+                            model, mix_train_loader, optimizer_ft, criterion, device, use_amp=use_amp
+                        )
+                        val_probs, val_y, val_age, t_valpred = predict_probs_labels_ages(
+                            model, val_loader, device, use_amp=use_amp
+                        )
+                        val_auc = safe_auc(val_y, val_probs)
+
+                        print(f"[{name}] pseudo epoch {epoch:02d}/{ft_epochs} "
+                              f"loss={loss_ft:.4f} val_auc={val_auc:.3f} "
+                              f"train_time={t_train_ft:.1f}s val_pred_time={t_valpred:.1f}s lr={ft_lr:g}")
+
+                        if np.isfinite(val_auc) and val_auc > best_val_auc_ft:
+                            best_val_auc_ft = val_auc
+                            torch.save(model.state_dict(), best_ft_path)
+                            print("  -> saved best pseudo")
+
+                    if best_ft_path.exists():
+                        model.load_state_dict(torch.load(best_ft_path, map_location=device))
+                        best_val_auc = best_val_auc_ft
 
     test_probs, test_y, test_age, t_testpred = predict_probs_labels_ages(model, test_loader, device, use_amp=use_amp)
     test_auc_all = safe_auc(test_y, test_probs)
@@ -1097,6 +1152,10 @@ def main(argv=None):
                         help="negative threshold for pseudo labeling")
     parser.add_argument("--pseudo_epochs", type=int, default=1,
                         help="fine-tuning epochs with pseudo-labeled samples")
+    parser.add_argument("--pseudo_retrain", action="store_true",
+                        help="retrain from scratch on train+pseudo instead of fine-tuning baseline model")
+    parser.add_argument("--pseudo_retrain_epochs", type=int, default=0,
+                        help="epochs for pseudo retraining; 0 uses --epochs")
     parser.add_argument("--pseudo_max_n", type=int, default=300,
                         help="maximum number of pseudo-labeled samples to add")
     parser.add_argument("--pseudo_batch", type=int, default=32,
@@ -1305,6 +1364,8 @@ def main(argv=None):
                 "max_n": args.pseudo_max_n,
                 "batch_size": args.pseudo_batch,
                 "lr": (args.pseudo_lr if args.pseudo_lr > 0 else 5e-5),
+                "retrain": bool(args.pseudo_retrain),
+                "retrain_epochs": (args.pseudo_retrain_epochs if args.pseudo_retrain_epochs > 0 else args.epochs),
             }
         )
         df["seed"] = s
