@@ -1,3 +1,5 @@
+<img width="755" height="1129" alt="image" src="https://github.com/user-attachments/assets/87689084-5a01-4379-83ec-3540b3749886" />
+
 # main_pseudo.py
 
 `main_pseudo.py` は、小児胸部X線画像を用いた性別二値分類のための学習スクリプトです。
