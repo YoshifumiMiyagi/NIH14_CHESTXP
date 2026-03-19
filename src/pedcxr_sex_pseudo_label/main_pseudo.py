@@ -18,7 +18,7 @@ from sklearn.metrics import roc_auc_score
 import torchvision.models as tv_models
 import torchvision.models as tv
 import timm
-
+from torchvision.transforms import v2
 import cv2
 from PIL import Image
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -121,12 +121,26 @@ def sex_to_int(s):
     # unknown -> raise (silent fail is dangerous)
     raise ValueError(f"Unknown sex label: {s}")
 
+# --- augmentation ---
+train_tf = v2.Compose([
+    v2.RandomRotation(7),
+])
+
+val_tf = None
+test_tf = None
+
+pseudo_tf = v2.Compose([
+    v2.RandomRotation(3),
+])
+
+# 心臓位置を残したいなら HorizontalFlip は入れない
 
 class EVACXRDataset(Dataset):
-    def __init__(self, images, ages, sex, sample_weight=None):
+    def __init__(self, images, ages, sex, sample_weight=None, transform=None):
         self.images = images
         self.ages = ages
         self.sex = sex
+        self.transform = transform
         self.sample_weight = (
             np.ones(len(images), dtype=np.float32)
             if sample_weight is None else np.asarray(sample_weight, dtype=np.float32)
@@ -137,14 +151,29 @@ class EVACXRDataset(Dataset):
 
     def __getitem__(self, idx):
         img = self.images[idx]
+
+        # numpy -> tensor
         if isinstance(img, np.ndarray):
             img = torch.from_numpy(img)
+
         img = img.float()
 
+        # HxW -> 1xHxW
         if img.ndim == 2:
             img = img.unsqueeze(0)
+
+        # 1ch -> 3ch
         if img.shape[0] == 1:
             img = img.repeat(3, 1, 1)
+
+        # 値域を必要なら [0,1] に揃える
+        # すでに前処理済みで [0,1] なら不要
+        if img.max() > 1.0:
+            img = img / 255.0
+
+        # augmentation
+        if self.transform is not None:
+            img = self.transform(img)
 
         age = self.ages[idx]
         sx  = self.sex[idx]
@@ -167,8 +196,9 @@ class EVACXRDataset(Dataset):
 
 
 class PseudoPoolDataset(Dataset):
-    def __init__(self, images, ages=None):
+    def __init__(self, images, ages=None, transform=None):
         self.images = images
+        self.transform = transform
         self.ages = np.full(len(images), -1, dtype=np.float32) if ages is None else np.asarray(ages)
 
     def __len__(self):
@@ -176,20 +206,33 @@ class PseudoPoolDataset(Dataset):
 
     def __getitem__(self, idx):
         img = self.images[idx]
+
         if isinstance(img, np.ndarray):
             img = torch.from_numpy(img)
+
         img = img.float()
 
         if img.ndim == 2:
             img = img.unsqueeze(0)
+
         if img.shape[0] == 1:
             img = img.repeat(3, 1, 1)
+
+        if img.max() > 1.0:
+            img = img / 255.0
+
+        if self.transform is not None:
+            img = self.transform(img)
 
         age = self.ages[idx]
         if isinstance(age, np.generic):
             age = age.item()
 
-        return img, torch.tensor(float(age), dtype=torch.float32), torch.tensor(int(idx), dtype=torch.long)
+        return (
+            img,
+            torch.tensor(float(age), dtype=torch.float32),
+            torch.tensor(int(idx), dtype=torch.long),
+        )
 
 
 def make_strata(ages, sex, age_bins=(0,5,10,15,19)):
@@ -199,9 +242,6 @@ def make_strata(ages, sex, age_bins=(0,5,10,15,19)):
 
 
 def split_train_val_test(indices, strata, groups, seed=42, test_splits=5, val_splits=8):
-    """
-    7:1:2 相当：まず test を sgkf_test で切って、その残りを sgkf_val で train/val に切る
-    """
     sgkf_test = StratifiedGroupKFold(n_splits=test_splits, shuffle=True, random_state=seed)
     trainval_idx, test_idx = next(sgkf_test.split(np.zeros(len(indices)), y=strata, groups=groups))
 
@@ -215,7 +255,6 @@ def split_train_val_test(indices, strata, groups, seed=42, test_splits=5, val_sp
     val_idx   = trainval_idx[va2]
 
     return train_idx, val_idx, test_idx
-
 
 # =========================
 # 4) Model builders (classification)
@@ -625,7 +664,10 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
                    epochs=10, base_lr=1e-4, use_amp=False,
                    save_root="checkpoints_compare",
                    age_bins=((0,4),(5,9),(10,14),(15,18)),
-                   pseudo_cfg=None):
+                   pseudo_cfg=None,
+                   train_transform=None,
+                   val_transform=None,
+                   test_transform=None):
 
     print("\n" + "="*100)
     print(f"EXPERIMENT: {exp_name}")
@@ -637,38 +679,59 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
     train_idx, val_idx, test_idx = split_train_val_test(
         idx_all, strata=strata, groups=pids, seed=seed
     )
+
     # ============================================================
     # Leakage check: pseudo pool vs train/val/test patient overlap
     # ============================================================
     train_pid_set = set(np.asarray(pids)[train_idx].tolist())
     val_pid_set   = set(np.asarray(pids)[val_idx].tolist())
     test_pid_set  = set(np.asarray(pids)[test_idx].tolist())
-    
+
     pseudo_pid_set = set()
     if pseudo_cfg is not None and pseudo_cfg.get("pids") is not None:
         pseudo_pid_set = set(np.asarray(pseudo_cfg["pids"]).tolist())
-    
+
     print("\n[Leakage Check]")
     print("pseudo ∩ train =", len(pseudo_pid_set & train_pid_set))
     print("pseudo ∩ val   =", len(pseudo_pid_set & val_pid_set))
     print("pseudo ∩ test  =", len(pseudo_pid_set & test_pid_set))
-    
+
     if len(pseudo_pid_set & train_pid_set) > 0:
         print("WARNING: pseudo pool overlaps with TRAIN patients")
     if len(pseudo_pid_set & val_pid_set) > 0:
         print("WARNING: pseudo pool overlaps with VAL patients")
     if len(pseudo_pid_set & test_pid_set) > 0:
         print("WARNING: pseudo pool overlaps with TEST patients")
-                       
-    print("N (train/val/test):", len(train_idx), len(val_idx), len(test_idx))
-    print("unique patients:", len(np.unique(np.asarray(pids)[train_idx])),
-                         len(np.unique(np.asarray(pids)[val_idx])),
-                         len(np.unique(np.asarray(pids)[test_idx])))
 
-    full_ds = EVACXRDataset(images=images, ages=ages, sex=sex)
-    train_ds = Subset(full_ds, train_idx)
-    val_ds   = Subset(full_ds, val_idx)
-    test_ds  = Subset(full_ds, test_idx)
+    print("N (train/val/test):", len(train_idx), len(val_idx), len(test_idx))
+    print("unique patients:",
+          len(np.unique(np.asarray(pids)[train_idx])),
+          len(np.unique(np.asarray(pids)[val_idx])),
+          len(np.unique(np.asarray(pids)[test_idx])))
+
+    # =========================
+    # Dataset with split-wise transform
+    # =========================
+    train_ds = EVACXRDataset(
+        images=np.asarray(images)[train_idx],
+        ages=np.asarray(ages)[train_idx],
+        sex=np.asarray(sex)[train_idx],
+        transform=train_transform,
+    )
+
+    val_ds = EVACXRDataset(
+        images=np.asarray(images)[val_idx],
+        ages=np.asarray(ages)[val_idx],
+        sex=np.asarray(sex)[val_idx],
+        transform=val_transform,
+    )
+
+    test_ds = EVACXRDataset(
+        images=np.asarray(images)[test_idx],
+        ages=np.asarray(ages)[test_idx],
+        sex=np.asarray(sex)[test_idx],
+        transform=test_transform,
+    )
 
     g = torch.Generator()
     g.manual_seed(seed)
@@ -707,7 +770,6 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
     df.to_csv(out_csv, index=False)
     print("saved:", out_csv)
     return df
-
 
 # =========================
 # 6) Segmentation parts (lung field) - minimal refactor
@@ -1340,9 +1402,9 @@ def main(argv=None):
         print("\n" + "#"*100)
         print(f"SEED RUN: {s}")
         print("#"*100)
-
+    
         set_seed(s, deterministic=args.deterministic)
-
+    
         df = run_experiment(
             exp_name=f"{exp_name}_seed{s}",
             images=imgs, ages=ages, sex=sex, pids=pids,
@@ -1366,8 +1428,16 @@ def main(argv=None):
                 "lr": (args.pseudo_lr if args.pseudo_lr > 0 else 5e-5),
                 "retrain": bool(args.pseudo_retrain),
                 "retrain_epochs": (args.pseudo_retrain_epochs if args.pseudo_retrain_epochs > 0 else args.epochs),
-            }
+    
+                # 追加
+                "transform": pseudo_tf,
+            },
+            # 追加
+            train_transform=train_tf,
+            val_transform=val_tf,
+            test_transform=test_tf,
         )
+    
         df["seed"] = s
         all_rows.append(df)
 
