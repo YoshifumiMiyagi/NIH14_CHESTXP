@@ -122,16 +122,20 @@ def sex_to_int(s):
     raise ValueError(f"Unknown sex label: {s}")
 
 # --- augmentation ---
-train_tf = v2.Compose([
-    v2.RandomRotation(7),
-])
+# train_tf = v2.Compose([
+#     v2.RandomRotation(7),
+# ])
 
 val_tf = None
 test_tf = None
 
-pseudo_tf = v2.Compose([
-    v2.RandomRotation(3),
-])
+# pseudo_tf = v2.Compose([
+#     v2.RandomRotation(3),
+# ])
+
+train_tf = None
+pseudo_tf = None
+
 
 # 心臓位置を残したいなら HorizontalFlip は入れない
 
