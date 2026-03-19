@@ -538,6 +538,7 @@ def run_one_model(name, train_loader, val_loader, test_loader, device,
                     )[keep_idx],
                     sex=np.where(pseudo_y == 0, "M", "F"),
                     sample_weight=pseudo_weight,
+                    transform=pseudo_cfg.get("transform", None), 
                 )
 
                 mix_train_ds = ConcatDataset([train_ds, pseudo_ds])
