@@ -1452,6 +1452,8 @@ def main(argv=None):
     print("\n=== DONE ===")
     print(df_agg)
 
+    print("df_all columns:", df_all.columns.tolist())
+    print("df_agg columns:", df_agg.columns.tolist())
     
 if __name__ == "__main__":
     main()
