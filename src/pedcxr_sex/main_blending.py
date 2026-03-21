@@ -1,0 +1,1452 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os, time, random, argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import roc_auc_score
+
+import torchvision.models as tv_models
+import torchvision.models as tv
+import timm
+
+import cv2
+from PIL import Image
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+# =========================
+# 0) Reproducibility
+# =========================
+def set_seed(seed=42, deterministic=False):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+
+def worker_init_fn(worker_id, base_seed=42):
+    s = base_seed + worker_id
+    np.random.seed(s)
+    random.seed(s)
+
+
+# =========================
+# 1) Utils: metrics
+# =========================
+def safe_auc(y_true, y_prob):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.size == 0 or np.unique(y_true).size < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, y_prob))
+
+
+def auc_by_age_bins(probs, labels, ages, bins, min_n=20):
+    rows = []
+    for lo, hi in bins:
+        idx = (ages >= lo) & (ages <= hi)
+        n = int(idx.sum())
+        auc = float("nan")
+        if n >= min_n and np.unique(labels[idx]).size >= 2:
+            auc = float(roc_auc_score(labels[idx], probs[idx]))
+        rows.append((f"{lo}-{hi}", n, auc))
+    return rows
+
+def macro_auc_from_bins(test_bins):
+    vals = [auc for _, _, auc in test_bins if np.isfinite(auc)]
+    if len(vals) == 0:
+        return float("nan")
+    return float(np.mean(vals))
+# =========================
+# 2) Classification preprocessing
+# =========================
+def preprocess_images(imgs):
+    """
+    imgs: (N,H,W) float32 0-1
+    return imgs_sc: (N,H,W) float32 0-1
+    """
+    N = len(imgs)
+    out = imgs.copy().astype(np.float32)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+
+    for i in range(N):
+        x = out[i].astype(np.float32)
+
+        p1, p99 = np.percentile(x, (1, 99))
+        x = np.clip(x, p1, p99)
+
+        x = (x - x.min()) / (x.max() - x.min() + 1e-6)
+
+        x8 = (x * 255).astype(np.uint8)
+        x = clahe.apply(x8).astype(np.float32) / 255.0
+
+        blur = cv2.GaussianBlur(x, (0,0), 3)
+        x = cv2.addWeighted(x, 1.5, blur, -0.5, 0)
+        x = np.clip(x, 0, 1)
+
+        x = (x - x.min()) / (x.max() - x.min() + 1e-6)
+
+        out[i] = x
+
+    return out
+
+
+# =========================
+# 3) Classification dataset
+# =========================
+def sex_to_int(s):
+    ss = str(s).strip().lower()
+    if ss in ["m", "male", "man", "1", "true"]:
+        return 0
+    if ss in ["f", "female", "woman", "0", "false"]:
+        return 1
+    # unknown -> raise (silent fail is dangerous)
+    raise ValueError(f"Unknown sex label: {s}")
+
+
+# class EVACXRDataset(Dataset):
+#     def __init__(self, images, ages, sex):
+#         self.images = images
+#         self.ages = ages
+#         self.sex = sex
+
+#     def __len__(self):
+#         return len(self.images)
+
+#     def __getitem__(self, idx):
+#         img = self.images[idx]
+#         if isinstance(img, np.ndarray):
+#             img = torch.from_numpy(img)
+#         img = img.float()
+
+#         if img.ndim == 2:
+#             img = img.unsqueeze(0)
+#         if img.shape[0] == 1:
+#             img = img.repeat(3, 1, 1)
+
+#         age = self.ages[idx]
+#         sx  = self.sex[idx]
+#         sx_i = sex_to_int(sx)
+
+#         if isinstance(age, np.generic):
+#             age = age.item()
+#         if isinstance(sx, np.generic):
+#             sx = sx.item()
+
+#         return img, torch.tensor(age, dtype=torch.float32), torch.tensor(sx_i, dtype=torch.long)
+
+class EVACXRDataset(Dataset):
+    def __init__(self, images, ages, sex, ids=None):
+        self.images = images
+        self.ages = ages
+        self.sex = sex
+        self.ids = np.arange(len(images)) if ids is None else ids
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+        img = img.float()
+
+        if img.ndim == 2:
+            img = img.unsqueeze(0)
+        if img.shape[0] == 1:
+            img = img.repeat(3, 1, 1)
+
+        age = self.ages[idx]
+        sx = self.sex[idx]
+        sx_i = sex_to_int(sx)
+        sample_id = self.ids[idx]
+
+        meta = {"image_id": sample_id}
+        return img, torch.tensor(age, dtype=torch.float32), torch.tensor(sx_i, dtype=torch.long), meta
+
+
+def make_strata(ages, sex, age_bins=(0,5,10,15,19)):
+    age_bin = pd.cut(ages, bins=list(age_bins), right=False, include_lowest=True)
+    strata = age_bin.astype(str) + "__" + pd.Series(sex).astype(str)
+    return np.asarray(strata)
+
+
+def split_train_val_test(indices, strata, groups, seed=42, test_splits=5, val_splits=8):
+    """
+    7:1:2 相当：まず test を sgkf_test で切って、その残りを sgkf_val で train/val に切る
+    """
+    sgkf_test = StratifiedGroupKFold(n_splits=test_splits, shuffle=True, random_state=seed)
+    trainval_idx, test_idx = next(sgkf_test.split(np.zeros(len(indices)), y=strata, groups=groups))
+
+    groups_tv = np.asarray(groups)[trainval_idx]
+    strata_tv = np.asarray(strata)[trainval_idx]
+
+    sgkf_val = StratifiedGroupKFold(n_splits=val_splits, shuffle=True, random_state=seed)
+    tr2, va2 = next(sgkf_val.split(np.zeros(len(trainval_idx)), y=strata_tv, groups=groups_tv))
+
+    train_idx = trainval_idx[tr2]
+    val_idx   = trainval_idx[va2]
+
+    return train_idx, val_idx, test_idx
+
+
+# =========================
+# 4) Model builders (classification)
+# =========================
+
+import torch
+import torch.nn as nn
+import torchvision.models as tv_models
+
+class ResNet18WithEmbedding(nn.Module):
+    def __init__(self, num_classes=1, pretrained=False):
+        super().__init__()
+        weights = tv_models.ResNet18_Weights.DEFAULT if pretrained else None
+        base = tv_models.resnet18(weights=weights)
+
+        self.backbone = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,
+            base.avgpool,
+        )
+        self.classifier = nn.Linear(base.fc.in_features, num_classes)
+
+    def forward(self, x, return_embedding=False):
+        feat = self.backbone(x)
+        feat = torch.flatten(feat, 1)   # [B, 512]
+        logits = self.classifier(feat)  # [B, 1]
+
+        if return_embedding:
+            return logits, feat
+        return logits
+
+def build_torchvision(name: str, num_classes=2):
+    name = name.lower()
+
+    if name == "resnet18":
+        m = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        return m
+
+    if name == "resnet50":
+        m = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V2)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        return m
+
+    if name == "resnet101":
+        m = tv_models.resnet101(weights=tv_models.ResNet101_Weights.IMAGENET1K_V2)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        return m
+
+    if name == "densenet121":
+        m = tv_models.densenet121(weights=tv_models.DenseNet121_Weights.IMAGENET1K_V1)
+        m.classifier = nn.Linear(m.classifier.in_features, num_classes)
+        return m
+
+    if name == "convnext_tiny":
+        m = tv_models.convnext_tiny(weights=tv_models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        m.classifier[2] = nn.Linear(m.classifier[2].in_features, num_classes)
+        return m
+
+    if name == "vit_b_16":
+        m = tv_models.vit_b_16(weights=tv_models.ViT_B_16_Weights.IMAGENET1K_V1)
+        m.heads.head = nn.Linear(m.heads.head.in_features, num_classes)
+        return m
+
+    if name == "swin_t":
+        m = tv_models.swin_t(weights=tv_models.Swin_T_Weights.IMAGENET1K_V1)
+        m.head = nn.Linear(m.head.in_features, num_classes)
+        return m
+
+    raise ValueError(f"[torchvision] Unknown model: {name}")
+
+
+def build_timm(name: str, num_classes=2):
+    return timm.create_model(name, pretrained=True, num_classes=num_classes)
+
+
+def build_model_any(name: str, num_classes=2):
+    tv_names = {"resnet18","resnet50","resnet101","densenet121","convnext_tiny","vit_b_16","swin_t"}
+    if name.lower() in tv_names:
+        return build_torchvision(name, num_classes=num_classes)
+    return build_timm(name, num_classes=num_classes)
+
+import numpy as np
+import torch
+
+@torch.no_grad()
+@torch.no_grad()
+@torch.no_grad()
+def extract_embeddings_and_probs(model, loader, device):
+    model.eval()
+
+    all_emb = []
+    all_logits = []
+    all_probs = []
+    all_y = []
+    all_ids = []
+
+    for x, age, y, meta in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits, emb = model(x, return_embedding=True)
+
+        if logits.ndim == 2 and logits.shape[1] == 1:
+            probs = torch.sigmoid(logits).squeeze(1)
+            logits_1d = logits.squeeze(1)
+        elif logits.ndim == 2 and logits.shape[1] == 2:
+            probs = torch.softmax(logits, dim=1)[:, 1]
+            logits_1d = logits[:, 1]
+        else:
+            raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
+
+        all_emb.append(emb.cpu().numpy())
+        all_logits.append(logits_1d.cpu().numpy())
+        all_probs.append(probs.cpu().numpy())
+        all_y.append(y.cpu().numpy())
+        all_ids.extend(list(meta["image_id"]))
+
+    emb = np.concatenate(all_emb, axis=0)
+    logits = np.concatenate(all_logits, axis=0)
+    probs = np.concatenate(all_probs, axis=0)
+    y_true = np.concatenate(all_y, axis=0)
+
+    return emb, logits, probs, y_true, np.array(all_ids)
+
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+
+def fit_embedding_lr(X_train, y_train, X_val, X_test):
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_val_s = scaler.transform(X_val)
+    X_test_s = scaler.transform(X_test)
+
+    clf = LogisticRegression(
+        max_iter=2000,
+        C=1.0,
+        penalty="l2",
+        solver="liblinear",
+        random_state=42
+    )
+    clf.fit(X_train_s, y_train)
+
+    prob_val = clf.predict_proba(X_val_s)[:, 1]
+    prob_test = clf.predict_proba(X_test_s)[:, 1]
+    return clf, scaler, prob_val, prob_test
+
+import pandas as pd
+
+def load_radiomics_by_ids(csv_path, ids, id_col="image_id", y_col=None):
+    df = pd.read_csv(csv_path)
+    assert id_col in df.columns, f"{id_col} not found in radiomics CSV"
+
+    feat_cols = [c for c in df.columns if c != id_col and c != y_col]
+    df = df.set_index(id_col)
+
+    X = []
+    missing = 0
+    for k in ids:
+        if k in df.index:
+            X.append(df.loc[k, feat_cols].values.astype(np.float32))
+        else:
+            X.append(np.full(len(feat_cols), np.nan, dtype=np.float32))
+            missing += 1
+
+    X = np.vstack(X)
+    print(f"[Radiomics] matched={len(ids)-missing}, missing={missing}")
+    return X, feat_cols
+
+from sklearn.impute import SimpleImputer
+
+def fit_radiomics_lr(X_train, y_train, X_val, X_test):
+    imp = SimpleImputer(strategy="median")
+    scaler = StandardScaler()
+
+    X_train_i = imp.fit_transform(X_train)
+    X_val_i = imp.transform(X_val)
+    X_test_i = imp.transform(X_test)
+
+    X_train_s = scaler.fit_transform(X_train_i)
+    X_val_s = scaler.transform(X_val_i)
+    X_test_s = scaler.transform(X_test_i)
+
+    clf = LogisticRegression(
+        max_iter=2000,
+        C=1.0,
+        penalty="l2",
+        solver="liblinear",
+        random_state=42
+    )
+    clf.fit(X_train_s, y_train)
+
+    prob_val = clf.predict_proba(X_val_s)[:, 1]
+    prob_test = clf.predict_proba(X_test_s)[:, 1]
+    return clf, imp, scaler, prob_val, prob_test
+
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+def blend_probs(prob_cnn, prob_embed, prob_radio, w=(0.4, 0.3, 0.3)):
+    w1, w2, w3 = w
+    return w1 * prob_cnn + w2 * prob_embed + w3 * prob_radio
+
+def blend_probs_2(prob_cnn, prob_embed, w=(0.5, 0.5)):
+    w1, w2 = w
+    return w1 * prob_cnn + w2 * prob_embed
+
+def fit_stacking_lr(prob_cnn_val, prob_embed_val, prob_radio_val, y_val,
+                    prob_cnn_test, prob_embed_test, prob_radio_test):
+    X_meta_val = np.column_stack([prob_cnn_val, prob_embed_val, prob_radio_val])
+    X_meta_test = np.column_stack([prob_cnn_test, prob_embed_test, prob_radio_test])
+
+    meta = LogisticRegression(
+        max_iter=1000,
+        solver="liblinear",
+        random_state=42
+    )
+    meta.fit(X_meta_val, y_val)
+    prob_test = meta.predict_proba(X_meta_test)[:, 1]
+    return meta, prob_test
+
+# =========================
+# 5) Train / Predict (classification)
+# =========================
+def train_one_epoch(model, loader, optimizer, criterion, device, use_amp=True):
+    model.train()
+    total_loss = 0.0
+
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp_enabled = bool(use_amp and device_type == "cuda")
+    scaler = torch.amp.GradScaler(device_type, enabled=amp_enabled)
+
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    for x, age, y, meta in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).long()
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast(device_type, enabled=amp_enabled):
+            logits = model(x)
+            loss = criterion(logits, y)
+
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        total_loss += float(loss.item())
+
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    return total_loss / max(len(loader), 1), (t1 - t0)
+
+
+@torch.no_grad()
+@torch.no_grad()
+def predict_probs_labels_ages(model, loader, device, use_amp=True):
+    model.eval()
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp_enabled = bool(use_amp and device_type == "cuda")
+
+    probs_list, y_list, age_list = [], [], []
+
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    for x, age, y, meta in loader:
+        x = x.to(device, non_blocking=True)
+
+        with torch.amp.autocast(device_type, enabled=amp_enabled):
+            logits = model(x)
+
+            # 2-class logits想定
+            if logits.ndim == 2 and logits.shape[1] == 2:
+                prob = torch.softmax(logits, dim=1)[:, 1]
+            # binary 1-logit想定
+            elif logits.ndim == 2 and logits.shape[1] == 1:
+                prob = torch.sigmoid(logits).squeeze(1)
+            else:
+                raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
+
+        probs_list.append(prob.detach().cpu().numpy())
+        y_list.append(np.asarray(y))
+        age_list.append(np.asarray(age))
+
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    probs = np.concatenate(probs_list)
+    y = np.concatenate(y_list)
+    age = np.concatenate(age_list)
+    return probs, y, age, (t1 - t0)
+
+
+def run_one_model(
+    name,
+    train_loader,
+    val_loader,
+    test_loader,
+    device,
+    age_bins=((0,4),(5,9),(10,14),(15,18)),
+    epochs=10,
+    base_lr=1e-4,
+    weight_decay=1e-4,
+    use_amp=False,
+    save_root="checkpoints_compare",
+    save_test_probs=True,
+    hybrid_mode="none",          # "none" / "blend" / "stack"
+    radio_csv="",
+    radio_id_col="image_id",
+    blend_w=(0.4, 0.3, 0.3),
+    save_embed_npy=False,
+):
+    save_root = Path(save_root)
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    # -------- model --------
+    if name.lower() == "resnet18":
+        model = ResNet18WithEmbedding(num_classes=2, pretrained=True).to(device)
+    else:
+        # hybridはまずresnet18限定がおすすめ
+        if hybrid_mode != "none":
+            raise ValueError("Hybrid mode is currently supported only for resnet18.")
+        model = build_model_any(name, num_classes=2).to(device)
+
+    lr = base_lr * 0.5 if "eva02" in name.lower() else base_lr
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_val_auc = -1.0
+    best_path = save_root / f"{name.replace('/','_')}_best.pth"
+
+    epoch_times = []
+    val_pred_times = []
+
+    # -------- train --------
+    for epoch in range(1, epochs + 1):
+        loss, t_train = train_one_epoch(model, train_loader, optimizer, criterion, device, use_amp=use_amp)
+        epoch_times.append(t_train)
+
+        val_probs, val_y, val_age, t_valpred = predict_probs_labels_ages(model, val_loader, device, use_amp=use_amp)
+        val_pred_times.append(t_valpred)
+
+        val_auc = safe_auc(val_y, val_probs)
+
+        print(f"[{name}] epoch {epoch:02d}/{epochs} "
+              f"loss={loss:.4f} val_auc={val_auc:.3f} "
+              f"train_time={t_train:.1f}s val_pred_time={t_valpred:.1f}s lr={lr:g}")
+
+        if np.isfinite(val_auc) and val_auc > best_val_auc:
+            best_val_auc = val_auc
+            torch.save(model.state_dict(), best_path)
+            print("  -> saved best")
+
+    if best_path.exists():
+        model.load_state_dict(torch.load(best_path, map_location=device))
+
+    # -------- base CNN eval --------
+    val_probs, val_y, val_age, t_valpred_final = predict_probs_labels_ages(model, val_loader, device, use_amp=use_amp)
+    test_probs, test_y, test_age, t_testpred = predict_probs_labels_ages(model, test_loader, device, use_amp=use_amp)
+
+    test_auc_all = safe_auc(test_y, test_probs)
+    test_bins = auc_by_age_bins(test_probs, test_y, test_age, bins=age_bins)
+    test_auc_macro_age = macro_auc_from_bins(test_bins)
+
+    print(f"[{name}] TEST AUC(all) = {test_auc_all:.3f}")
+    print(f"[{name}] TEST MACRO AUC(age bins) = {test_auc_macro_age:.3f}")
+    print("  test bins:", test_bins)
+
+    prob_val_cnn = val_probs
+    prob_test_cnn = test_probs
+
+    # default outputs
+    auc_embed_val = np.nan
+    auc_embed_test = np.nan
+    auc_radio_val = np.nan
+    auc_radio_test = np.nan
+    auc_final = np.nan
+    prob_val_embed = None
+    prob_test_embed = None
+    prob_val_radio = None
+    prob_test_radio = None
+    prob_val_final = None
+    prob_test_final = None
+
+    # -------- embedding / hybrid --------
+
+    if hybrid_mode == "blend" and not radio_csv:
+        prob_val_final = blend_probs_2(prob_val_cnn, prob_val_embed, w=(0.5, 0.5))
+        prob_test_final = blend_probs_2(prob_test_cnn, prob_test_embed, w=(0.5, 0.5))
+        auc_final = safe_auc(y_test_embed, prob_test_final)
+        print(f"[Hybrid-blend CNN+Embed] test AUC: {auc_final:.4f}")
+      
+    if hybrid_mode != "none" or radio_csv:
+        if name.lower() != "resnet18":
+            raise ValueError("Embedding extraction currently supported only for resnet18.")
+
+        emb_train, _, _, y_train_embed, ids_train = extract_embeddings_and_probs(model, train_loader, device)
+        emb_val, _, _, y_val_embed, ids_val = extract_embeddings_and_probs(model, val_loader, device)
+        emb_test, _, _, y_test_embed, ids_test = extract_embeddings_and_probs(model, test_loader, device)
+
+        _, scaler_lr, prob_val_embed, prob_test_embed = fit_embedding_lr(
+            emb_train, y_train_embed, emb_val, emb_test
+        )
+
+        auc_embed_val = safe_auc(y_val_embed, prob_val_embed)
+        auc_embed_test = safe_auc(y_test_embed, prob_test_embed)
+        print(f"[Embed] val AUC : {auc_embed_val:.4f}")
+        print(f"[Embed] test AUC: {auc_embed_test:.4f}")
+
+        if radio_csv:
+            Xr_train, radio_cols = load_radiomics_by_ids(
+                radio_csv, ids_train, id_col=radio_id_col
+            )
+            Xr_val, _ = load_radiomics_by_ids(
+                radio_csv, ids_val, id_col=radio_id_col
+            )
+            Xr_test, _ = load_radiomics_by_ids(
+                radio_csv, ids_test, id_col=radio_id_col
+            )
+
+            _, _, _, prob_val_radio, prob_test_radio = fit_radiomics_lr(
+                Xr_train, y_train_embed, Xr_val, Xr_test
+            )
+
+            auc_radio_val = safe_auc(y_val_embed, prob_val_radio)
+            auc_radio_test = safe_auc(y_test_embed, prob_test_radio)
+            print(f"[Radio] val AUC : {auc_radio_val:.4f}")
+            print(f"[Radio] test AUC: {auc_radio_test:.4f}")
+
+            if hybrid_mode == "blend":
+                prob_val_final = blend_probs(
+                    prob_val_cnn, prob_val_embed, prob_val_radio, w=blend_w
+                )
+                prob_test_final = blend_probs(
+                    prob_test_cnn, prob_test_embed, prob_test_radio, w=blend_w
+                )
+
+            elif hybrid_mode == "stack":
+                meta_model, prob_test_final = fit_stacking_lr(
+                    prob_val_cnn, prob_val_embed, prob_val_radio, y_val_embed,
+                    prob_test_cnn, prob_test_embed, prob_test_radio
+                )
+                prob_val_final = None
+
+            if prob_test_final is not None:
+                auc_final = safe_auc(y_test_embed, prob_test_final)
+                print(f"[Hybrid-{hybrid_mode}] test AUC: {auc_final:.4f}")
+
+        # save embedding related files here
+        if save_embed_npy:
+            np.save(save_root / f"emb_train_{name.replace('/','_')}.npy", emb_train)
+            np.save(save_root / f"emb_val_{name.replace('/','_')}.npy", emb_val)
+            np.save(save_root / f"emb_test_{name.replace('/','_')}.npy", emb_test)
+
+            np.save(save_root / f"prob_val_embed_{name.replace('/','_')}.npy", prob_val_embed)
+            np.save(save_root / f"prob_test_embed_{name.replace('/','_')}.npy", prob_test_embed)
+
+            if radio_csv and prob_val_radio is not None:
+                np.save(save_root / f"prob_val_radio_{name.replace('/','_')}.npy", prob_val_radio)
+                np.save(save_root / f"prob_test_radio_{name.replace('/','_')}.npy", prob_test_radio)
+
+            if hybrid_mode in ["blend", "stack"] and prob_test_final is not None:
+                np.save(save_root / f"prob_test_{hybrid_mode}_{name.replace('/','_')}.npy", prob_test_final)
+
+    if save_test_probs:
+        np.save(save_root / f"test_prob_{name.replace('/','_')}.npy", np.asarray(test_probs))
+
+    row = {
+        "model": name,
+        "val_auc_best": best_val_auc,
+        "test_auc_all": test_auc_all,
+        "test_auc_macro_age": test_auc_macro_age,
+        "auc_embed_val": auc_embed_val,
+        "auc_embed_test": auc_embed_test,
+        "auc_radio_val": auc_radio_val,
+        "auc_radio_test": auc_radio_test,
+        "auc_hybrid_test": auc_final,
+        "time_train_total_sec": float(np.sum(epoch_times)),
+        "time_train_epoch_mean_sec": float(np.mean(epoch_times)),
+        "time_val_pred_total_sec": float(np.sum(val_pred_times)),
+        "time_test_pred_sec": float(t_testpred),
+    }
+
+    for bin_name, n, auc in test_bins:
+        row[f"test_auc_{bin_name}"] = auc
+        row[f"n_{bin_name}"] = n
+
+    return row
+
+def run_experiment(exp_name, images, ages, sex, pids, model_names,
+                   seed=42, batch_size=32, num_workers=2,
+                   epochs=10, base_lr=1e-4, use_amp=False,
+                   save_root="checkpoints_compare",
+                   age_bins=((0,4),(5,9),(10,14),(15,18)),
+                   hybrid_mode="none",
+                   radio_csv="",
+                   radio_id_col="image_id",
+                   blend_w=(0.4, 0.3, 0.3),
+                   save_embed_npy=False):
+
+    print("\n" + "="*100)
+    print(f"EXPERIMENT: {exp_name}")
+    print("="*100)
+
+    strata = make_strata(ages, sex)
+    idx_all = np.arange(len(images))
+
+    train_idx, val_idx, test_idx = split_train_val_test(
+        idx_all, strata=strata, groups=pids, seed=seed
+    )
+    print("N (train/val/test):", len(train_idx), len(val_idx), len(test_idx))
+    print("unique patients:", len(np.unique(np.asarray(pids)[train_idx])),
+                         len(np.unique(np.asarray(pids)[val_idx])),
+                         len(np.unique(np.asarray(pids)[test_idx])))
+
+    full_ds = EVACXRDataset(images=images, ages=ages, sex=sex, ids=np.arange(len(images)))
+    train_ds = Subset(full_ds, train_idx)
+    val_ds   = Subset(full_ds, val_idx)
+    test_ds  = Subset(full_ds, test_idx)
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=True, worker_init_fn=lambda wid: worker_init_fn(wid, seed),
+        generator=g
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True, worker_init_fn=lambda wid: worker_init_fn(wid, seed),
+        generator=g
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True, worker_init_fn=lambda wid: worker_init_fn(wid, seed),
+        generator=g
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    results = []
+
+    for mn in model_names:
+        row = run_one_model(
+            mn, train_loader, val_loader, test_loader, device,
+            age_bins=age_bins,
+            epochs=epochs,
+            base_lr=base_lr,
+            use_amp=use_amp,
+            save_root=save_root,
+            save_test_probs=True,
+            hybrid_mode=hybrid_mode,
+            radio_csv=radio_csv,
+            radio_id_col=radio_id_col,
+            blend_w=blend_w,
+            save_embed_npy=save_embed_npy,
+        )
+        row["experiment"] = exp_name
+        results.append(row)
+
+    df = pd.DataFrame(results)
+    out_csv = Path(save_root) / f"results_{exp_name.replace(' ','_')}.csv"
+    df.to_csv(out_csv, index=False)
+    print("saved:", out_csv)
+    return df
+
+
+# =========================
+# 6) Segmentation parts (lung field) - minimal refactor
+# =========================
+class StackSegDataset(Dataset):
+    def __init__(self, X, Y, indices=None, size=512, do_aug=False):
+        self.X = X
+        self.Y = Y
+        self.size = size
+        self.do_aug = do_aug
+        self.indices = np.arange(len(Y)) if indices is None else np.array(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, k):
+        i = int(self.indices[k])
+        img = np.asarray(self.X[i])
+        mask = np.asarray(self.Y[i])
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+
+        img  = cv2.resize(img,  (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (self.size, self.size), interpolation=cv2.INTER_NEAREST)
+
+        mask = (mask > 0).astype(np.float32)
+
+        img  = torch.from_numpy(img).float().unsqueeze(0)
+        mask = torch.from_numpy(mask).float().unsqueeze(0)
+
+        img = (img - img.min()) / (img.max() - img.min() + 1e-6)
+
+        if self.do_aug:
+            if torch.rand(1).item() < 0.5:
+                img  = torch.flip(img,  dims=[2])
+                mask = torch.flip(mask, dims=[2])
+            if torch.rand(1).item() < 0.8:
+                gain = 1.0 + (torch.rand(1).item() - 0.5) * 0.10
+                bias = (torch.rand(1).item() - 0.5) * 0.05
+                img = torch.clamp(img * gain + bias, 0.0, 1.0)
+
+        return img, mask
+
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.conv1 = ConvBNReLU(in_ch + skip_ch, out_ch)
+        self.conv2 = ConvBNReLU(out_ch, out_ch)
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv2(self.conv1(x))
+        return x
+
+
+class ResNet18UNet(nn.Module):
+    def __init__(self, pretrained=True):
+        super().__init__()
+        m = tv.resnet18(weights=tv.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+
+        self.conv1 = m.conv1
+        self.bn1   = m.bn1
+        self.relu  = m.relu
+        self.maxpool = m.maxpool
+
+        self.layer1 = m.layer1
+        self.layer2 = m.layer2
+        self.layer3 = m.layer3
+        self.layer4 = m.layer4
+
+        self.bridge = nn.Sequential(ConvBNReLU(512, 512), ConvBNReLU(512, 512))
+
+        self.dec4 = DecoderBlock(512, 512, 256)
+        self.dec3 = DecoderBlock(256, 256, 128)
+        self.dec2 = DecoderBlock(128, 128, 64)
+        self.dec1 = DecoderBlock(64,  64,  64)
+
+        self.head = nn.Conv2d(64, 1, 1)
+
+    def forward(self, x):
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+
+        x0 = self.relu(self.bn1(self.conv1(x)))
+        x1 = self.maxpool(x0)
+
+        e1 = self.layer1(x1)
+        e2 = self.layer2(e1)
+        e3 = self.layer3(e2)
+        e4 = self.layer4(e3)
+
+        b  = self.bridge(e4)
+
+        d4 = self.dec4(b,  e4)
+        d3 = self.dec3(d4, e3)
+        d2 = self.dec2(d3, e2)
+        d1 = self.dec1(d2, e1)
+
+        out = F.interpolate(d1, scale_factor=4, mode="bilinear", align_corners=False)
+        return self.head(out)
+
+
+def dice_loss_logits(logits, targets, eps=1e-6):
+    probs = torch.sigmoid(logits).flatten(1)
+    targets = targets.flatten(1)
+    inter = (probs * targets).sum(1)
+    den = probs.sum(1) + targets.sum(1)
+    dice = (2*inter + eps) / (den + eps)
+    return (1 - dice).mean()
+
+
+@torch.no_grad()
+def dice_score_logits(logits, targets, thr=0.5, eps=1e-6):
+    probs = torch.sigmoid(logits)
+    preds = (probs > thr).float()
+    inter = (preds * targets).sum(dim=(2,3))
+    union = preds.sum(dim=(2,3)) + targets.sum(dim=(2,3))
+    return ((2*inter + eps) / (union + eps)).mean().item()
+
+
+def set_encoder_trainable(model, trainable: bool):
+    enc = []
+    enc += list(model.conv1.parameters())
+    enc += list(model.bn1.parameters())
+    enc += list(model.layer1.parameters())
+    enc += list(model.layer2.parameters())
+    enc += list(model.layer3.parameters())
+    enc += list(model.layer4.parameters())
+    for p in enc:
+        p.requires_grad = trainable
+
+
+def run_train_seg(model, train_loader, val_loader, device,
+                  epochs=30, lr=2e-4, weight_decay=1e-4,
+                  unfreeze_epoch=10, unfreeze_lr=1e-4,
+                  patience=5, save_path="best_pretrain_all.pt",
+                  w_dice=0.7, pos_weight=3.0, use_amp=True):
+
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp_enabled = bool(use_amp and device_type == "cuda")
+    scaler = torch.amp.GradScaler(device_type, enabled=amp_enabled)
+
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+
+    def loss_fn(logits, targets):
+        return w_dice * dice_loss_logits(logits, targets) + (1-w_dice) * bce(logits, targets)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    model = model.to(device)
+
+    set_encoder_trainable(model, False)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                                  lr=lr, weight_decay=weight_decay)
+
+    best = -1.0
+    bad = 0
+
+    for ep in range(1, epochs + 1):
+        if ep == unfreeze_epoch + 1:
+            set_encoder_trainable(model, True)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=unfreeze_lr, weight_decay=weight_decay)
+            print(f"✅ encoder unfrozen @epoch {ep}, lr={unfreeze_lr}")
+
+        model.train()
+        tr_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast(device_type, enabled=amp_enabled):
+                logits = model(xb)
+                loss = loss_fn(logits, yb)
+
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
+            tr_loss += loss.item() * xb.size(0)
+
+        tr_loss /= max(len(train_loader.dataset), 1)
+
+        model.eval()
+        va_dices = []
+        va_losses = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                with torch.amp.autocast(device_type, enabled=amp_enabled):
+                    logits = model(xb)
+                    loss = loss_fn(logits, yb)
+                va_losses.append(float(loss.item()))
+                va_dices.append(float(dice_score_logits(logits, yb)))
+
+        va_loss = float(np.mean(va_losses)) if va_losses else float("nan")
+        va_dice = float(np.mean(va_dices)) if va_dices else float("nan")
+
+        print(f"Epoch {ep:03d} | train_loss {tr_loss:.4f} | val_loss {va_loss:.4f} | val_dice {va_dice:.4f}")
+
+        if np.isfinite(va_dice) and va_dice > best + 1e-4:
+            best = va_dice
+            bad = 0
+            torch.save({"model": model.state_dict(), "best_val_dice": best}, save_path)
+            print("  ✅ saved best:", best)
+        else:
+            bad += 1
+            if bad >= patience:
+                print("  ⏹ early stopping. best val dice:", best)
+                break
+
+    return str(save_path), best
+
+# =========================
+# (ADD) Seg inference utils
+# =========================
+class SegInferDataset(Dataset):
+    def __init__(self, X, size=512):
+        self.X = X
+        self.size = size
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        img = np.asarray(self.X[i])
+        img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        img = img.astype(np.float32)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-6)
+        img = torch.from_numpy(img).float().unsqueeze(0)  # (1,H,W)
+        return img, i
+
+@torch.no_grad()
+def infer_lung_masks_all(seg_model, images, device, batch_size=8, num_workers=2, thr=0.5, use_amp=True):
+    seg_model.eval()
+    ds = SegInferDataset(images, size=512)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp_enabled = bool(use_amp and device_type == "cuda")
+
+    N = len(images)
+    out = np.zeros((N, 512, 512), dtype=np.uint8)
+
+    for xb, idx in loader:
+        xb = xb.to(device, non_blocking=True)
+        with torch.amp.autocast(device_type, enabled=amp_enabled):
+            logits = seg_model(xb)          # (B,1,H,W) 想定
+        if logits.ndim == 3:
+            logits = logits.unsqueeze(1)
+        prob = torch.sigmoid(logits)[:, 0]  # (B,H,W)
+        pred = (prob > thr).to(torch.uint8).cpu().numpy()
+
+        idx = idx.cpu().numpy()
+        out[idx] = pred
+
+    return out
+
+# =========================
+# 7) Thorax crop by lung mask
+# =========================
+def central_crop_bbox(H, W, scale=0.75):
+    s = int(min(H, W) * scale)
+    y1 = (H - s)//2
+    x1 = (W - s)//2
+    return x1, y1, x1+s, y1+s
+
+
+def bbox_from_lung_mask_safe(mask, pad_x=0.1, pad_y=0.1, extra_down=0.1,
+                            make_square=True, min_area_ratio=0.05):
+    m = (mask > 0).astype(np.uint8)
+    H, W = m.shape
+
+    k = max(3, (min(H, W)//256)*2 + 3)
+    kernel = np.ones((k, k), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+
+    if m.sum() < H*W*min_area_ratio:
+        return central_crop_bbox(H, W, scale=0.75)
+
+    ys, xs = np.where(m > 0)
+    x1, x2 = xs.min(), xs.max()
+    y1, y2 = ys.min(), ys.max()
+
+    bw = (x2 - x1 + 1)
+    bh = (y2 - y1 + 1)
+
+    px = int(bw * pad_x)
+    py = int(bh * pad_y)
+    pd = int(bh * extra_down)
+
+    x1 = max(0, x1 - px)
+    x2 = min(W-1, x2 + px)
+    y1 = max(0, y1 - py)
+    y2 = min(H-1, y2 + py + pd)
+
+    if make_square:
+        bw = x2 - x1 + 1
+        bh = y2 - y1 + 1
+        s = max(bw, bh)
+        cx = (x1 + x2)//2
+        cy = (y1 + y2)//2
+
+        x1 = cx - s//2
+        x2 = x1 + s - 1
+        y1 = cy - s//2
+        y2 = y1 + s - 1
+
+        if x1 < 0: x2 -= x1; x1 = 0
+        if y1 < 0: y2 -= y1; y1 = 0
+        if x2 >= W:
+            d = x2 - (W-1); x1 -= d; x2 = W-1
+            x1 = max(0, x1)
+        if y2 >= H:
+            d = y2 - (H-1); y1 -= d; y2 = H-1
+            y1 = max(0, y1)
+
+    return int(x1), int(y1), int(x2+1), int(y2+1)
+
+
+def crop_resize_norm(img, mask, out_size=512):
+    H, W = img.shape[:2]
+    x1,y1,x2,y2 = bbox_from_lung_mask_safe(mask, min_area_ratio=0.05)
+    img_c = img[y1:y2, x1:x2]
+    img_p = Image.fromarray(img_c.astype(np.float32)).resize((out_size, out_size), Image.BILINEAR)
+    x = np.array(img_p, dtype=np.float32)
+    x = (x - x.min()) / (x.max() - x.min() + 1e-6)
+    return x
+
+
+def make_thorax_crop_memmap(images, masks, out_path, out_size=512):
+    out_path = Path(out_path)
+    N = len(images)
+    mm = np.memmap(out_path, dtype="float32", mode="w+", shape=(N, out_size, out_size))
+    for i in range(N):
+        mm[i] = crop_resize_norm(images[i], masks[i], out_size=out_size)
+        if (i+1) % 200 == 0:
+            print("crop done", i+1, "/", N)
+    mm.flush()
+    return mm
+
+def aggregate_seed_results(df_all: pd.DataFrame, age_bins=((0,4),(5,9),(10,14),(15,18))):
+    """
+    df_all: rows = (seed x model)
+    returns: df_agg with mean/sd per model
+    """
+    # 集計対象カラム
+    cols = ["val_auc_best", "test_auc_all"]
+    for lo, hi in age_bins:
+        cols.append(f"test_auc_{lo}-{hi}")
+
+    # 数値化（念のため）
+    for c in cols:
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+
+    g = df_all.groupby("model", dropna=False)
+
+    mean_df = g[cols].mean(numeric_only=True).reset_index()
+    sd_df   = g[cols].std(ddof=1, numeric_only=True).reset_index()
+
+    mean_df["stat"] = "mean"
+    sd_df["stat"]   = "sd"
+
+    df_agg = pd.concat([mean_df, sd_df], axis=0, ignore_index=True)
+
+    # 見やすい順
+    front = ["model", "stat"]
+    rest = [c for c in df_agg.columns if c not in front]
+    df_agg = df_agg[front + rest]
+    return df_agg
+
+
+# =========================
+# 8) main()
+# =========================
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--img_npy", type=str, required=True,
+                        help="cxr_pediatric_images512_...npy (dict with keys images/ages/patient_id/sex)")
+    parser.add_argument("--out_dir", type=str, default="checkpoints_compare")
+    parser.add_argument("--models", type=str, default="resnet18",
+                        help="comma separated, e.g. resnet18,convnext_tiny")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_amp", action="store_true")
+
+    parser.add_argument("--do_preprocess", action="store_true",
+                        help="apply CLAHE+enhance preprocessing")
+    parser.add_argument("--do_crop", action="store_true",
+                        help="apply thorax crop using precomputed lung mask")
+    parser.add_argument("--lung_mask_npy", type=str, default="",
+                        help="lung_mask_3400.npy (uint8 0/1), required if --do_crop")
+    parser.add_argument("--train_seg", action="store_true",
+                        help="train lung segmentation using StackSegDataset and save weights")
+    parser.add_argument("--seg_xy_npy", type=str, default="",
+                        help="seg training data npy (dict with keys: images, masks). e.g. infant masks set")
+    parser.add_argument("--seg_epochs", type=int, default=30)
+    parser.add_argument("--seg_lr", type=float, default=2e-4)
+    parser.add_argument("--seg_unfreeze_epoch", type=int, default=10)
+    parser.add_argument("--seg_unfreeze_lr", type=float, default=1e-4)
+    parser.add_argument("--seg_batch", type=int, default=8)
+    parser.add_argument("--seg_thr", type=float, default=0.5)
+    parser.add_argument("--seg_weights", type=str, default="",
+                        help="path to pretrained seg weights. If empty and --train_seg, will use saved weights")
+    parser.add_argument("--seeds", type=str, default="",
+                    help="comma separated seeds for repeated runs, e.g. 42,43,44,45,46. If set, overrides --seed")
+    parser.add_argument("--deterministic", action="store_true",
+                    help="enable deterministic cudnn/algorithms (better reproducibility, slower)")
+
+      # --- hybrid / embedding / radiomics ---
+    parser.add_argument("--hybrid_mode", type=str, default="none",
+                        choices=["none", "blend", "stack"],
+                        help="Hybrid mode: none / blend / stack")
+    
+    parser.add_argument("--embed_clf", type=str, default="lr",
+                        choices=["lr"],
+                        help="Classifier for CNN embeddings")
+    
+    parser.add_argument("--radio_csv", type=str, default="",
+                        help="Radiomics CSV path")
+    parser.add_argument("--radio_id_col", type=str, default="image_id",
+                        help="ID column in radiomics CSV to align samples")
+    parser.add_argument("--dataset_id_key", type=str, default="image",
+                        help="Meta key from dataset used to align radiomics")
+    
+    parser.add_argument("--blend_w_cnn", type=float, default=0.4)
+    parser.add_argument("--blend_w_embed", type=float, default=0.3)
+    parser.add_argument("--blend_w_radio", type=float, default=0.3)
+    
+    parser.add_argument("--save_embed_npy", action="store_true")
+
+    args = parser.parse_args(argv)
+
+    set_seed(args.seed, deterministic=args.deterministic)
+
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    data = np.load(args.img_npy, allow_pickle=True).item()
+    imgs = data["images"]
+    ages = data["ages"]
+    pids = data["patient_id"]
+    sex  = data["sex"]
+
+    # =========================
+    # (ADD) Train seg / make masks if needed
+    # =========================
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    seg_weights_path = args.seg_weights.strip()
+    if args.train_seg:
+        if not args.seg_xy_npy:
+            raise ValueError("--train_seg requires --seg_xy_npy (dict: images, masks)")
+        seg_data = np.load(args.seg_xy_npy, allow_pickle=True).item()
+        Xs = np.asarray(seg_data["images"]).astype(np.float32)
+        Ys = np.asarray(seg_data["masks"]).astype(np.uint8)
+        if Ys.ndim == 4:
+            Ys = Ys[..., 0]
+
+        # simple 80/20 split（小規模mask想定なのでまずはこれで）
+        N = len(Xs)
+        rng = np.random.RandomState(args.seed)
+        idx = np.arange(N)
+        rng.shuffle(idx)
+        n_tr = int(N * 0.8)
+        tr_idx, va_idx = idx[:n_tr], idx[n_tr:]
+
+        tr_ds = StackSegDataset(Xs, Ys, indices=tr_idx, size=512, do_aug=True)
+        va_ds = StackSegDataset(Xs, Ys, indices=va_idx, size=512, do_aug=False)
+
+        g_seg = torch.Generator()
+        g_seg.manual_seed(args.seed)
+
+        tr_loader = DataLoader(tr_ds, batch_size=args.seg_batch, shuffle=True,
+                               num_workers=args.workers, pin_memory=True,
+                               worker_init_fn=lambda wid: worker_init_fn(wid, args.seed),
+                               generator=g_seg)
+        va_loader = DataLoader(va_ds, batch_size=args.seg_batch, shuffle=False,
+                               num_workers=args.workers, pin_memory=True,
+                               worker_init_fn=lambda wid: worker_init_fn(wid, args.seed),
+                               generator=g_seg)
+
+        seg_model = ResNet18UNet(pretrained=True).to(device)
+
+        seg_out = Path(args.out_dir) / "seg"
+        seg_out.mkdir(parents=True, exist_ok=True)
+        save_path = seg_out / "lungseg_best.pt"
+
+        wpath, best_dice = run_train_seg(
+            seg_model,
+            tr_loader, va_loader,
+            device=device,
+            epochs=args.seg_epochs,
+            lr=args.seg_lr,
+            unfreeze_epoch=args.seg_unfreeze_epoch,
+            unfreeze_lr=args.seg_unfreeze_lr,
+            patience=8,
+            save_path=str(save_path),
+            use_amp=args.use_amp
+        )
+        print("Seg training done. weights:", wpath, "best_dice:", best_dice)
+        seg_weights_path = str(save_path)
+
+    # --- If cropping is requested but mask file is not provided, try to infer masks using seg weights
+    if args.do_crop and (not args.lung_mask_npy):
+        if not seg_weights_path:
+            raise ValueError("--do_crop requires --lung_mask_npy OR seg weights via --seg_weights / --train_seg")
+        print(">>> --do_crop: no lung_mask_npy provided. Will infer masks using:", seg_weights_path)
+
+        ckpt = torch.load(seg_weights_path, map_location=device)
+        seg_model = ResNet18UNet(pretrained=False).to(device)
+        # run_train_seg saves {"model": state_dict, ...}
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        seg_model.load_state_dict(state, strict=True)
+
+        masks_pred = infer_lung_masks_all(
+            seg_model, imgs, device=device,
+            batch_size=args.seg_batch, num_workers=args.workers,
+            thr=args.seg_thr, use_amp=args.use_amp
+        )
+        out_mask = Path(args.out_dir) / "lung_mask_pred_512.npy"
+        np.save(out_mask, masks_pred.astype(np.uint8))
+        print("saved inferred masks:", out_mask, "shape:", masks_pred.shape)
+
+        # set as lung_mask_npy for the existing crop path
+        args.lung_mask_npy = str(out_mask)
+    
+    imgs = np.asarray(imgs).astype(np.float32)
+    print("Loaded images:", imgs.shape, imgs.min(), imgs.max())
+
+    if args.do_preprocess:
+        print(">>> preprocessing enabled")
+        imgs = preprocess_images(imgs)
+
+    if args.do_crop:
+        if not args.lung_mask_npy:
+            raise ValueError("--do_crop requires --lung_mask_npy")
+        masks = np.load(args.lung_mask_npy, mmap_mode="r")
+        if masks.ndim == 4:
+            masks = masks[..., 0]
+        print("Loaded masks:", masks.shape, masks.dtype, "unique:", np.unique(masks)[:10])
+
+        crop_path = out_dir / "thorax_crop_all_512.npy"
+        print(">>> thorax cropping ->", crop_path)
+        imgs = make_thorax_crop_memmap(imgs, masks, crop_path, out_size=512)
+        # memmap returns view; keep as np.asarray-like
+        print("Cropped images:", imgs.shape, float(np.min(imgs)), float(np.max(imgs)))
+
+    model_names = [m.strip() for m in args.models.split(",") if m.strip()]
+
+    # --- seeds parsing ---
+    if args.seeds.strip():
+        seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
+    else:
+        seeds = [int(args.seed)]
+
+    exp_name = ("Preproc+Crop" if (args.do_preprocess and args.do_crop)
+                else "Preprocessing" if args.do_preprocess
+                else "Thoracic_Crop" if args.do_crop
+                else "Baseline")
+
+    all_rows = []
+    for s in seeds:
+        print("\n" + "#"*100)
+        print(f"SEED RUN: {s}")
+        print("#"*100)
+
+        set_seed(s, deterministic=args.deterministic)
+
+        df = run_experiment(
+            exp_name=f"{exp_name}_seed{s}",
+            images=imgs, ages=ages, sex=sex, pids=pids,
+            model_names=model_names,
+            seed=s, batch_size=args.batch, num_workers=args.workers,
+            epochs=args.epochs, base_lr=1e-4, use_amp=args.use_amp,
+            save_root=str(out_dir),hybrid_mode=args.hybrid_mode,
+            radio_csv=args.radio_csv,
+            radio_id_col=args.radio_id_col,
+            blend_w=(args.blend_w_cnn, args.blend_w_embed, args.blend_w_radio),
+            save_embed_npy=args.save_embed_npy,
+            age_bins=((0,4),(5,9),(10,14),(15,18))
+        )
+        df["seed"] = s
+        all_rows.append(df)
+
+    df_all = pd.concat(all_rows, axis=0, ignore_index=True)
+
+    # --- save per-seed results ---
+    out_csv_all = out_dir / f"results_{exp_name}_seedRepeated.csv"
+    df_all.to_csv(out_csv_all, index=False)
+    print("saved:", out_csv_all)
+
+    # --- aggregate mean/sd across seeds per model ---
+    df_agg = aggregate_seed_results(df_all, age_bins=((0,4),(5,9),(10,14),(15,18)))
+    out_csv_agg = out_dir / f"results_{exp_name}_seedRepeated_mean_sd.csv"
+    df_agg.to_csv(out_csv_agg, index=False)
+    print("saved:", out_csv_agg)
+
+    # --- print summary: test AUC mean±SD per model ---
+    # 取り出しやすいように pivot
+    piv = df_agg.pivot(index="model", columns="stat", values="test_auc_all")
+    print("\n=== SUMMARY (test_auc_all) ===")
+    for m in piv.index:
+        mu = piv.loc[m].get("mean", np.nan)
+        sd = piv.loc[m].get("sd", np.nan)
+        print(f"{m}: {mu:.3f} ± {sd:.3f}")
+
+    # bin別も出す（存在する列だけ）
+    for lo, hi in ((0,4),(5,9),(10,14),(15,18)):
+        col = f"test_auc_{lo}-{hi}"
+        if col in df_all.columns:
+            pivb = df_agg.pivot(index="model", columns="stat", values=col)
+            print(f"\n=== SUMMARY ({col}) ===")
+            for m in pivb.index:
+                mu = pivb.loc[m].get("mean", np.nan)
+                sd = pivb.loc[m].get("sd", np.nan)
+                print(f"{m}: {mu:.3f} ± {sd:.3f}")
+    piv_macro = df_agg.pivot(index="model", columns="stat", values="test_auc_macro_age")
+    print("\n=== SUMMARY (test_auc_macro_age) ===")
+    for m in piv_macro.index:
+        mu = piv_macro.loc[m].get("mean", np.nan)
+        sd = piv_macro.loc[m].get("sd", np.nan)
+        print(f"{m}: {mu:.3f} ± {sd:.3f}")
+    print("\n=== DONE ===")
+    print(df_agg)
+
+    
+if __name__ == "__main__":
+    main()
