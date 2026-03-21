@@ -368,25 +368,22 @@ def fit_embedding_lr(X_train, y_train, X_val, X_test):
 
 import pandas as pd
 
-def load_radiomics_by_ids(csv_path, ids, id_col="image_id", y_col=None):
+def load_radiomics_by_ids(csv_path, ids, id_col="image_id"):
     df = pd.read_csv(csv_path)
-    assert id_col in df.columns, f"{id_col} not found in radiomics CSV"
 
-    feat_cols = [c for c in df.columns if c != id_col and c != y_col]
-    df = df.set_index(id_col)
-
-    X = []
-    missing = 0
-    for k in ids:
-        if k in df.index:
-            X.append(df.loc[k, feat_cols].values.astype(np.float32))
+    # auto-detect
+    if id_col not in df.columns:
+        if "pids" in df.columns:
+            df = df.rename(columns={"pids": id_col})
+        elif "pid" in df.columns:
+            df = df.rename(columns={"pid": id_col})
         else:
-            X.append(np.full(len(feat_cols), np.nan, dtype=np.float32))
-            missing += 1
+            raise ValueError(f"{id_col} not found and no alternative ID column found")
 
-    X = np.vstack(X)
-    print(f"[Radiomics] matched={len(ids)-missing}, missing={missing}")
-    return X, feat_cols
+    df = df.set_index(id_col)
+    X = df.loc[ids].values
+
+    return X, df.columns.tolist()
 
 from sklearn.impute import SimpleImputer
 
