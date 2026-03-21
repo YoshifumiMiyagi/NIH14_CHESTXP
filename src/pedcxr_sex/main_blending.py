@@ -368,23 +368,29 @@ def fit_embedding_lr(X_train, y_train, X_val, X_test):
 
 import pandas as pd
 
-def load_radiomics_by_ids(csv_path, ids, id_col="pids"):
+def load_radiomics_by_ids(csv_path, ids, id_col="patient_id"):
     df = pd.read_csv(csv_path)
-
-    print("DEBUG requested id_col:", id_col)
-    print("DEBUG radiomics columns:", df.columns.tolist())
-
-    if id_col not in df.columns:
-        raise ValueError(f"{id_col} not found in radiomics CSV. available columns: {df.columns.tolist()}")
 
     df[id_col] = df[id_col].astype(str)
     ids = pd.Index(ids).astype(str)
 
     df = df.set_index(id_col)
 
+    # ---- ここ追加 ----
+    # 不要列削除
+    drop_cols = ["sex", "age"]  # 必要なら調整
+    for c in drop_cols:
+        if c in df.columns:
+            df = df.drop(columns=c)
+
+    # 数値のみ残す
+    df = df.select_dtypes(include=[np.number])
+
+    # ------------------
+
     missing = ids.difference(df.index)
     if len(missing) > 0:
-        raise ValueError(f"{len(missing)} IDs missing in radiomics CSV. examples: {list(missing[:10])}")
+        raise ValueError(f"{len(missing)} IDs missing in radiomics CSV")
 
     X = df.loc[ids].values
     return X, df.columns.tolist()
