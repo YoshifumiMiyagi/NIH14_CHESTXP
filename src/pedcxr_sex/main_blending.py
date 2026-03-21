@@ -1427,7 +1427,7 @@ def main(argv=None):
         mu = piv.loc[m].get("mean", np.nan)
         sd = piv.loc[m].get("sd", np.nan)
         print(f"{m}: {mu:.3f} ± {sd:.3f}")
-
+    
     # bin別も出す（存在する列だけ）
     for lo, hi in ((0,4),(5,9),(10,14),(15,18)):
         col = f"test_auc_{lo}-{hi}"
@@ -1438,12 +1438,18 @@ def main(argv=None):
                 mu = pivb.loc[m].get("mean", np.nan)
                 sd = pivb.loc[m].get("sd", np.nan)
                 print(f"{m}: {mu:.3f} ± {sd:.3f}")
-    piv_macro = df_agg.pivot(index="model", columns="stat", values="test_auc_macro_age")
-    print("\n=== SUMMARY (test_auc_macro_age) ===")
-    for m in piv_macro.index:
-        mu = piv_macro.loc[m].get("mean", np.nan)
-        sd = piv_macro.loc[m].get("sd", np.nan)
-        print(f"{m}: {mu:.3f} ± {sd:.3f}")
+    
+    # macro age-bin AUC
+    if "test_auc_macro_age" in df_all.columns:
+        piv_macro = df_agg.pivot(index="model", columns="stat", values="test_auc_macro_age")
+        print("\n=== SUMMARY (test_auc_macro_age) ===")
+        for m in piv_macro.index:
+            mu = piv_macro.loc[m].get("mean", np.nan)
+            sd = piv_macro.loc[m].get("sd", np.nan)
+            print(f"{m}: {mu:.3f} ± {sd:.3f}")
+    else:
+        print("\n[INFO] test_auc_macro_age not found in df_all")
+    
     print("\n=== DONE ===")
     print(df_agg)
 
