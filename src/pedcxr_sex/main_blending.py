@@ -540,7 +540,7 @@ def run_one_model(
     save_test_probs=True,
     hybrid_mode="none",          # "none" / "blend" / "stack"
     radio_csv="",
-    radio_id_col="pids",
+    radio_id_col="patient_id",
     blend_w=(0.4, 0.3, 0.3),
     save_embed_npy=False,
 ):
@@ -741,7 +741,7 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
                    age_bins=((0,4),(5,9),(10,14),(15,18)),
                    hybrid_mode="none",
                    radio_csv="",
-                   radio_id_col="pids",
+                   radio_id_col="patient_id",
                    blend_w=(0.4, 0.3, 0.3),
                    save_embed_npy=False):
 
@@ -1293,7 +1293,7 @@ def main(argv=None):
     
     parser.add_argument("--radio_csv", type=str, default="",
                         help="Radiomics CSV path")
-    parser.add_argument("--radio_id_col", type=str, default="pids",
+    parser.add_argument("--radio_id_col", type=str, default="patient_id",
                         help="ID column in radiomics CSV to align samples")
     parser.add_argument("--dataset_id_key", type=str, default="image",
                         help="Meta key from dataset used to align radiomics")
