@@ -616,84 +616,110 @@ def run_one_model(
     prob_test_final = None
 
     # -------- embedding / hybrid --------
+# -------- embedding / hybrid --------
+auc_embed_val = np.nan
+auc_embed_test = np.nan
+auc_radio_val = np.nan
+auc_radio_test = np.nan
+auc_final = np.nan
 
+prob_val_embed = None
+prob_test_embed = None
+prob_val_radio = None
+prob_test_radio = None
+prob_val_final = None
+prob_test_final = None
+
+if hybrid_mode != "none" or radio_csv:
+    if name.lower() != "resnet18":
+        raise ValueError("Embedding extraction currently supported only for resnet18.")
+
+    # 1) extract embeddings
+    emb_train, _, _, y_train_embed, ids_train = extract_embeddings_and_probs(
+        model, train_loader, device
+    )
+    emb_val, _, _, y_val_embed, ids_val = extract_embeddings_and_probs(
+        model, val_loader, device
+    )
+    emb_test, _, _, y_test_embed, ids_test = extract_embeddings_and_probs(
+        model, test_loader, device
+    )
+
+    # 2) embedding LR
+    _, scaler_lr, prob_val_embed, prob_test_embed = fit_embedding_lr(
+        emb_train, y_train_embed, emb_val, emb_test
+    )
+
+    auc_embed_val = safe_auc(y_val_embed, prob_val_embed)
+    auc_embed_test = safe_auc(y_test_embed, prob_test_embed)
+
+    print(f"[Embed] val AUC : {auc_embed_val:.4f}")
+    print(f"[Embed] test AUC: {auc_embed_test:.4f}")
+
+    # 3) no-radiomics case: CNN + Embed only
     if hybrid_mode == "blend" and not radio_csv:
         prob_val_final = blend_probs_2(prob_val_cnn, prob_val_embed, w=(0.5, 0.5))
         prob_test_final = blend_probs_2(prob_test_cnn, prob_test_embed, w=(0.5, 0.5))
         auc_final = safe_auc(y_test_embed, prob_test_final)
         print(f"[Hybrid-blend CNN+Embed] test AUC: {auc_final:.4f}")
-      
-    if hybrid_mode != "none" or radio_csv:
-        if name.lower() != "resnet18":
-            raise ValueError("Embedding extraction currently supported only for resnet18.")
 
-        emb_train, _, _, y_train_embed, ids_train = extract_embeddings_and_probs(model, train_loader, device)
-        emb_val, _, _, y_val_embed, ids_val = extract_embeddings_and_probs(model, val_loader, device)
-        emb_test, _, _, y_test_embed, ids_test = extract_embeddings_and_probs(model, test_loader, device)
-
-        _, scaler_lr, prob_val_embed, prob_test_embed = fit_embedding_lr(
-            emb_train, y_train_embed, emb_val, emb_test
+    # 4) radiomics
+    if radio_csv:
+        Xr_train, radio_cols = load_radiomics_by_ids(
+            radio_csv, ids_train, id_col=radio_id_col
+        )
+        Xr_val, _ = load_radiomics_by_ids(
+            radio_csv, ids_val, id_col=radio_id_col
+        )
+        Xr_test, _ = load_radiomics_by_ids(
+            radio_csv, ids_test, id_col=radio_id_col
         )
 
-        auc_embed_val = safe_auc(y_val_embed, prob_val_embed)
-        auc_embed_test = safe_auc(y_test_embed, prob_test_embed)
-        print(f"[Embed] val AUC : {auc_embed_val:.4f}")
-        print(f"[Embed] test AUC: {auc_embed_test:.4f}")
+        _, _, _, prob_val_radio, prob_test_radio = fit_radiomics_lr(
+            Xr_train, y_train_embed, Xr_val, Xr_test
+        )
 
-        if radio_csv:
-            Xr_train, radio_cols = load_radiomics_by_ids(
-                radio_csv, ids_train, id_col=radio_id_col
+        auc_radio_val = safe_auc(y_val_embed, prob_val_radio)
+        auc_radio_test = safe_auc(y_test_embed, prob_test_radio)
+
+        print(f"[Radio] val AUC : {auc_radio_val:.4f}")
+        print(f"[Radio] test AUC: {auc_radio_test:.4f}")
+
+        # 5) hybrid with radiomics
+        if hybrid_mode == "blend":
+            prob_val_final = blend_probs(
+                prob_val_cnn, prob_val_embed, prob_val_radio, w=blend_w
             )
-            Xr_val, _ = load_radiomics_by_ids(
-                radio_csv, ids_val, id_col=radio_id_col
-            )
-            Xr_test, _ = load_radiomics_by_ids(
-                radio_csv, ids_test, id_col=radio_id_col
+            prob_test_final = blend_probs(
+                prob_test_cnn, prob_test_embed, prob_test_radio, w=blend_w
             )
 
-            _, _, _, prob_val_radio, prob_test_radio = fit_radiomics_lr(
-                Xr_train, y_train_embed, Xr_val, Xr_test
+        elif hybrid_mode == "stack":
+            meta_model, prob_test_final = fit_stacking_lr(
+                prob_val_cnn, prob_val_embed, prob_val_radio, y_val_embed,
+                prob_test_cnn, prob_test_embed, prob_test_radio
             )
+            prob_val_final = None  # 必要なら後でval予測も返すよう拡張
 
-            auc_radio_val = safe_auc(y_val_embed, prob_val_radio)
-            auc_radio_test = safe_auc(y_test_embed, prob_test_radio)
-            print(f"[Radio] val AUC : {auc_radio_val:.4f}")
-            print(f"[Radio] test AUC: {auc_radio_test:.4f}")
+        if prob_test_final is not None:
+            auc_final = safe_auc(y_test_embed, prob_test_final)
+            print(f"[Hybrid-{hybrid_mode}] test AUC: {auc_final:.4f}")
 
-            if hybrid_mode == "blend":
-                prob_val_final = blend_probs(
-                    prob_val_cnn, prob_val_embed, prob_val_radio, w=blend_w
-                )
-                prob_test_final = blend_probs(
-                    prob_test_cnn, prob_test_embed, prob_test_radio, w=blend_w
-                )
+    # 6) save embedding related files
+    if save_embed_npy:
+        np.save(save_root / f"emb_train_{name.replace('/','_')}.npy", emb_train)
+        np.save(save_root / f"emb_val_{name.replace('/','_')}.npy", emb_val)
+        np.save(save_root / f"emb_test_{name.replace('/','_')}.npy", emb_test)
 
-            elif hybrid_mode == "stack":
-                meta_model, prob_test_final = fit_stacking_lr(
-                    prob_val_cnn, prob_val_embed, prob_val_radio, y_val_embed,
-                    prob_test_cnn, prob_test_embed, prob_test_radio
-                )
-                prob_val_final = None
+        np.save(save_root / f"prob_val_embed_{name.replace('/','_')}.npy", prob_val_embed)
+        np.save(save_root / f"prob_test_embed_{name.replace('/','_')}.npy", prob_test_embed)
 
-            if prob_test_final is not None:
-                auc_final = safe_auc(y_test_embed, prob_test_final)
-                print(f"[Hybrid-{hybrid_mode}] test AUC: {auc_final:.4f}")
+        if radio_csv and prob_val_radio is not None:
+            np.save(save_root / f"prob_val_radio_{name.replace('/','_')}.npy", prob_val_radio)
+            np.save(save_root / f"prob_test_radio_{name.replace('/','_')}.npy", prob_test_radio)
 
-        # save embedding related files here
-        if save_embed_npy:
-            np.save(save_root / f"emb_train_{name.replace('/','_')}.npy", emb_train)
-            np.save(save_root / f"emb_val_{name.replace('/','_')}.npy", emb_val)
-            np.save(save_root / f"emb_test_{name.replace('/','_')}.npy", emb_test)
-
-            np.save(save_root / f"prob_val_embed_{name.replace('/','_')}.npy", prob_val_embed)
-            np.save(save_root / f"prob_test_embed_{name.replace('/','_')}.npy", prob_test_embed)
-
-            if radio_csv and prob_val_radio is not None:
-                np.save(save_root / f"prob_val_radio_{name.replace('/','_')}.npy", prob_val_radio)
-                np.save(save_root / f"prob_test_radio_{name.replace('/','_')}.npy", prob_test_radio)
-
-            if hybrid_mode in ["blend", "stack"] and prob_test_final is not None:
-                np.save(save_root / f"prob_test_{hybrid_mode}_{name.replace('/','_')}.npy", prob_test_final)
+        if hybrid_mode in ["blend", "stack"] and prob_test_final is not None:
+            np.save(save_root / f"prob_test_{hybrid_mode}_{name.replace('/','_')}.npy", prob_test_final)
 
     if save_test_probs:
         np.save(save_root / f"test_prob_{name.replace('/','_')}.npy", np.asarray(test_probs))
