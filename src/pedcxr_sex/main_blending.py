@@ -1165,8 +1165,30 @@ def aggregate_seed_results(df_all: pd.DataFrame, age_bins=((0,4),(5,9),(10,14),(
     """
     # 集計対象カラム
     cols = ["val_auc_best", "test_auc_all"]
+
     for lo, hi in age_bins:
-        cols.append(f"test_auc_{lo}-{hi}")
+        col = f"test_auc_{lo}-{hi}"
+        if col in df_all.columns:
+            cols.append(col)
+
+    # macro age-bin AUC も追加
+    if "test_auc_macro_age" in df_all.columns:
+        cols.append("test_auc_macro_age")
+
+    # 必要なら他の指標も追加可能
+    extra_cols = [
+        "auc_embed_val",
+        "auc_embed_test",
+        "auc_radio_val",
+        "auc_radio_test",
+        "auc_hybrid_test",
+    ]
+    for c in extra_cols:
+        if c in df_all.columns:
+            cols.append(c)
+
+    # 重複除去
+    cols = list(dict.fromkeys(cols))
 
     # 数値化（念のため）
     for c in cols:
@@ -1187,6 +1209,7 @@ def aggregate_seed_results(df_all: pd.DataFrame, age_bins=((0,4),(5,9),(10,14),(
     front = ["model", "stat"]
     rest = [c for c in df_agg.columns if c not in front]
     df_agg = df_agg[front + rest]
+
     return df_agg
 
 
@@ -1438,8 +1461,8 @@ def main(argv=None):
                 sd = pivb.loc[m].get("sd", np.nan)
                 print(f"{m}: {mu:.3f} ± {sd:.3f}")
     
-    # macro age-bin AUC
-    if "test_auc_macro_age" in df_all.columns:
+      # macro age-bin AUC
+    if "test_auc_macro_age" in df_agg.columns:
         piv_macro = df_agg.pivot(index="model", columns="stat", values="test_auc_macro_age")
         print("\n=== SUMMARY (test_auc_macro_age) ===")
         for m in piv_macro.index:
@@ -1447,7 +1470,7 @@ def main(argv=None):
             sd = piv_macro.loc[m].get("sd", np.nan)
             print(f"{m}: {mu:.3f} ± {sd:.3f}")
     else:
-        print("\n[INFO] test_auc_macro_age not found in df_all")
+        print("\n[INFO] test_auc_macro_age not found in df_agg")
     
     print("\n=== DONE ===")
     print(df_agg)
