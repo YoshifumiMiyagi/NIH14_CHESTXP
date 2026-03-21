@@ -368,21 +368,25 @@ def fit_embedding_lr(X_train, y_train, X_val, X_test):
 
 import pandas as pd
 
-def load_radiomics_by_ids(csv_path, ids, id_col="image_id"):
+def load_radiomics_by_ids(csv_path, ids, id_col="pids"):
     df = pd.read_csv(csv_path)
 
-    # auto-detect
+    print("DEBUG requested id_col:", id_col)
+    print("DEBUG radiomics columns:", df.columns.tolist())
+
     if id_col not in df.columns:
-        if "pids" in df.columns:
-            df = df.rename(columns={"pids": id_col})
-        elif "pid" in df.columns:
-            df = df.rename(columns={"pid": id_col})
-        else:
-            raise ValueError(f"{id_col} not found and no alternative ID column found")
+        raise ValueError(f"{id_col} not found in radiomics CSV. available columns: {df.columns.tolist()}")
+
+    df[id_col] = df[id_col].astype(str)
+    ids = pd.Index(ids).astype(str)
 
     df = df.set_index(id_col)
-    X = df.loc[ids].values
 
+    missing = ids.difference(df.index)
+    if len(missing) > 0:
+        raise ValueError(f"{len(missing)} IDs missing in radiomics CSV. examples: {list(missing[:10])}")
+
+    X = df.loc[ids].values
     return X, df.columns.tolist()
 
 from sklearn.impute import SimpleImputer
@@ -536,7 +540,7 @@ def run_one_model(
     save_test_probs=True,
     hybrid_mode="none",          # "none" / "blend" / "stack"
     radio_csv="",
-    radio_id_col="image_id",
+    radio_id_col='pids,
     blend_w=(0.4, 0.3, 0.3),
     save_embed_npy=False,
 ):
@@ -737,7 +741,7 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
                    age_bins=((0,4),(5,9),(10,14),(15,18)),
                    hybrid_mode="none",
                    radio_csv="",
-                   radio_id_col="image_id",
+                   radio_id_col="pids",
                    blend_w=(0.4, 0.3, 0.3),
                    save_embed_npy=False):
 
@@ -745,21 +749,37 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
     print(f"EXPERIMENT: {exp_name}")
     print("="*100)
 
+    images = np.asarray(images)
+    ages   = np.asarray(ages)
+    sex    = np.asarray(sex)
+    pids   = np.asarray(pids).astype(str)
+
     strata = make_strata(ages, sex)
     idx_all = np.arange(len(images))
 
     train_idx, val_idx, test_idx = split_train_val_test(
         idx_all, strata=strata, groups=pids, seed=seed
     )
-    print("N (train/val/test):", len(train_idx), len(val_idx), len(test_idx))
-    print("unique patients:", len(np.unique(np.asarray(pids)[train_idx])),
-                         len(np.unique(np.asarray(pids)[val_idx])),
-                         len(np.unique(np.asarray(pids)[test_idx])))
 
-    full_ds = EVACXRDataset(images=images, ages=ages, sex=sex, ids=np.arange(len(images)))
-    train_ds = Subset(full_ds, train_idx)
-    val_ds   = Subset(full_ds, val_idx)
-    test_ds  = Subset(full_ds, test_idx)
+    print("N (train/val/test):", len(train_idx), len(val_idx), len(test_idx))
+    print("unique patients:",
+          len(np.unique(pids[train_idx])),
+          len(np.unique(pids[val_idx])),
+          len(np.unique(pids[test_idx])))
+
+    # --- split actual arrays ---
+    X_train, X_val, X_test = images[train_idx], images[val_idx], images[test_idx]
+    age_train, age_val, age_test = ages[train_idx], ages[val_idx], ages[test_idx]
+    y_train, y_val, y_test = sex[train_idx], sex[val_idx], sex[test_idx]
+    pids_train, pids_val, pids_test = pids[train_idx], pids[val_idx], pids[test_idx]
+
+    # debug
+    print("DEBUG pids_train[:5] =", pids_train[:5])
+
+    # --- datasets: ids must be pids ---
+    train_ds = EVACXRDataset(X_train, age_train, y_train, ids=pids_train)
+    val_ds   = EVACXRDataset(X_val, age_val, y_val, ids=pids_val)
+    test_ds  = EVACXRDataset(X_test, age_test, y_test, ids=pids_test)
 
     g = torch.Generator()
     g.manual_seed(seed)
