@@ -1420,7 +1420,6 @@ def main(argv=None):
     print("saved:", out_csv_agg)
 
     # --- print summary: test AUC mean±SD per model ---
-    # 取り出しやすいように pivot
     piv = df_agg.pivot(index="model", columns="stat", values="test_auc_all")
     print("\n=== SUMMARY (test_auc_all) ===")
     for m in piv.index:
