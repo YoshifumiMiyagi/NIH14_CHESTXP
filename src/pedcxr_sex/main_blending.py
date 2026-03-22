@@ -368,29 +368,25 @@ def fit_embedding_lr(X_train, y_train, X_val, X_test):
 
 import pandas as pd
 
-def load_radiomics_by_ids(csv_path, ids, id_col="patient_id"):
+def load_radiomics_by_ids(csv_path, ids, id_col="sample_id"):
     df = pd.read_csv(csv_path)
 
     df[id_col] = df[id_col].astype(str)
     ids = pd.Index(ids).astype(str)
 
-    df = df.set_index(id_col)
-
-    # ---- ここ追加 ----
     # 不要列削除
-    drop_cols = ["sex", "age"]  # 必要なら調整
-    for c in drop_cols:
-        if c in df.columns:
-            df = df.drop(columns=c)
+    drop_cols = ["Unnamed: 0", "sex", "age", "patient_id"]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-    # 数値のみ残す
+    # 数値列だけ
+    feature_cols = [c for c in df.columns if c != id_col]
+    df = df[[id_col] + feature_cols]
+    df = df.set_index(id_col)
     df = df.select_dtypes(include=[np.number])
-
-    # ------------------
 
     missing = ids.difference(df.index)
     if len(missing) > 0:
-        raise ValueError(f"{len(missing)} IDs missing in radiomics CSV")
+        raise ValueError(f"{len(missing)} IDs missing in radiomics CSV. examples: {list(missing[:10])}")
 
     X = df.loc[ids].values
     return X, df.columns.tolist()
@@ -747,7 +743,7 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
                    age_bins=((0,4),(5,9),(10,14),(15,18)),
                    hybrid_mode="none",
                    radio_csv="",
-                   radio_id_col="patient_id",
+                   radio_id_col="sample_id",
                    blend_w=(0.4, 0.3, 0.3),
                    save_embed_npy=False):
 
@@ -760,9 +756,13 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
     sex    = np.asarray(sex)
     pids   = np.asarray(pids).astype(str)
 
+    # 3400例の画像単位ID
+    sample_ids = np.arange(len(images)).astype(str)
+
     strata = make_strata(ages, sex)
     idx_all = np.arange(len(images))
 
+    # split は patient_id ベース
     train_idx, val_idx, test_idx = split_train_val_test(
         idx_all, strata=strata, groups=pids, seed=seed
     )
@@ -773,19 +773,18 @@ def run_experiment(exp_name, images, ages, sex, pids, model_names,
           len(np.unique(pids[val_idx])),
           len(np.unique(pids[test_idx])))
 
-    # --- split actual arrays ---
     X_train, X_val, X_test = images[train_idx], images[val_idx], images[test_idx]
     age_train, age_val, age_test = ages[train_idx], ages[val_idx], ages[test_idx]
     y_train, y_val, y_test = sex[train_idx], sex[val_idx], sex[test_idx]
-    pids_train, pids_val, pids_test = pids[train_idx], pids[val_idx], pids[test_idx]
 
-    # debug
-    print("DEBUG pids_train[:5] =", pids_train[:5])
+    # 画像単位IDを使う
+    sample_ids_train = sample_ids[train_idx]
+    sample_ids_val   = sample_ids[val_idx]
+    sample_ids_test  = sample_ids[test_idx]
 
-    # --- datasets: ids must be pids ---
-    train_ds = EVACXRDataset(X_train, age_train, y_train, ids=pids_train)
-    val_ds   = EVACXRDataset(X_val, age_val, y_val, ids=pids_val)
-    test_ds  = EVACXRDataset(X_test, age_test, y_test, ids=pids_test)
+    train_ds = EVACXRDataset(X_train, age_train, y_train, ids=sample_ids_train)
+    val_ds   = EVACXRDataset(X_val, age_val, y_val, ids=sample_ids_val)
+    test_ds  = EVACXRDataset(X_test, age_test, y_test, ids=sample_ids_test)
 
     g = torch.Generator()
     g.manual_seed(seed)
