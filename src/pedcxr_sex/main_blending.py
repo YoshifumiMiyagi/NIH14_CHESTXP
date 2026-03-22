@@ -619,6 +619,9 @@ def run_one_model(
     prob_val_final = None
     prob_test_final = None
 
+    test_bins_hybrid = None
+    test_auc_macro_age_hybrid = np.nan
+
     # -------- embedding / hybrid --------
     if hybrid_mode != "none" or radio_csv:
         if name.lower() != "resnet18":
@@ -691,9 +694,22 @@ def run_one_model(
                 )
                 prob_val_final = None  # 必要なら後でval予測も返すよう拡張
 
+            test_bins_hybrid = None
+            test_auc_macro_age_hybrid = np.nan
+            
             if prob_test_final is not None:
+                # overall AUC
                 auc_final = safe_auc(y_test_embed, prob_test_final)
-                print(f"[Hybrid-{hybrid_mode}] test AUC: {auc_final:.4f}")
+            
+                # age-bin AUC
+                test_bins_hybrid = auc_by_age_bins(
+                    prob_test_final, y_test_embed, test_age, bins=age_bins
+                )
+                test_auc_macro_age_hybrid = macro_auc_from_bins(test_bins_hybrid)
+            
+                print(f"[Hybrid-{hybrid_mode}] TEST AUC(all) = {auc_final:.4f}")
+                print(f"[Hybrid-{hybrid_mode}] TEST MACRO AUC(age bins) = {test_auc_macro_age_hybrid:.4f}")
+                print("  hybrid bins:", test_bins_hybrid)
 
         # 6) save embedding related files
         if save_embed_npy:
@@ -724,15 +740,16 @@ def run_one_model(
         "auc_radio_val": auc_radio_val,
         "auc_radio_test": auc_radio_test,
         "auc_hybrid_test": auc_final,
+        "auc_hybrid_macro_age": test_auc_macro_age_hybrid,
         "time_train_total_sec": float(np.sum(epoch_times)),
         "time_train_epoch_mean_sec": float(np.mean(epoch_times)),
         "time_val_pred_total_sec": float(np.sum(val_pred_times)),
         "time_test_pred_sec": float(t_testpred),
     }
 
-    for bin_name, n, auc in test_bins:
-        row[f"test_auc_{bin_name}"] = auc
-        row[f"n_{bin_name}"] = n
+    if test_bins_hybrid is not None:
+        for bin_name, n, auc in test_bins_hybrid:
+            row[f"hybrid_auc_{bin_name}"] = auc
 
     return row
 
